@@ -223,13 +223,16 @@ const upload = multer({
     const mimetype = String(file.mimetype || "");
     const ext = path.extname(file.originalname || "").toLowerCase();
 
-    // allow "video/*" OR common video extensions (covers octet-stream uploads)
-    const commonVideoExts = new Set([
-      ".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg",
-    ]);
+    const commonVideoExts = new Set([".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg"]);
+    const commonAudioExts = new Set([".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"]);
 
-    const ok = mimetype.startsWith("video/") || commonVideoExts.has(ext);
-    cb(ok ? null : new Error("Only video files allowed"), ok);
+    const ok =
+      mimetype.startsWith("video/") ||
+      mimetype.startsWith("audio/") ||
+      commonVideoExts.has(ext) ||
+      commonAudioExts.has(ext);
+
+    cb(ok ? null : new Error("Only video/audio files allowed"), ok);
   },
 });
 
@@ -474,11 +477,16 @@ async function fetchVideosFromDb() {
       v.title,
       v.description,
       v.category,
-      v.visibility,
+      WHERE v.visibility = 'public'
+        AND v.asset_scope = 'public'
+        AND v.media_type = 'video'
       v.filename,
       v.thumb,
       v.duration_text,
       v.views,
+      v.media_type,
+      v.asset_scope,
+      v.filename,
       v.tags,
       v.created_at AS "createdAt",
       v.updated_at AS "updatedAt",
@@ -505,11 +513,16 @@ async function fetchVideoById(videoId) {
       v.description,
       v.category,
       v.visibility,
+      v.media_type,
+      v.asset_scope,
+      v.filename,
       v.filename,
       v.thumb,
       v.duration_text,
       v.views,
       v.tags,
+      v.asset_scope,
+      v.media_type,
       v.created_at AS "createdAt",
       v.updated_at AS "updatedAt",
       u.username AS channel_username,
@@ -569,6 +582,8 @@ async function toApiVideo(req, v) {
     views: v.views ?? null,
     durationText: v.duration_text || null,
     tags: Array.isArray(v.tags) ? v.tags : [],
+    mediaType: v.media_type || "video",
+    assetScope: v.asset_scope || "public",
 
     ratingAvg,
     ratingCount,
@@ -605,6 +620,8 @@ app.get("/__ffmpeg", async (_req, res) => {
 // GET /api/profile/u/:username/videos?sort=newest|oldest|views|highest
 app.get("/api/profile/u/:username/videos", async (req, res) => {
   try {
+    const scope = String(req.query.scope || "").toLowerCase().trim(); // "public"|"library"|"" (default)
+    const type = String(req.query.type || "").toLowerCase().trim();   // "video"|"audio"|"all"|"" (default)
     const username = String(req.params.username || "").trim();
     const sort = String(req.query.sort || "newest").toLowerCase().trim();
 
@@ -622,6 +639,9 @@ app.get("/api/profile/u/:username/videos", async (req, res) => {
     // If viewing your own profile, include private/unlisted too
     const requesterId = req.user?.id ? Number(req.user.id) : null;
     const includeAll = requesterId != null && requesterId === channelUserId;
+    if (scope === "library" && !includeAll) {
+      return res.status(403).json({ error: "Library assets are owner-only" });
+    }
 
     // Sorting
     let orderBy = "v.created_at DESC";
@@ -644,6 +664,8 @@ app.get("/api/profile/u/:username/videos", async (req, res) => {
         v.description,
         v.category,
         v.visibility,
+        v.media_type,
+        v.asset_scope,
         v.filename,
         v.thumb,
         v.duration_text,
@@ -659,10 +681,17 @@ app.get("/api/profile/u/:username/videos", async (req, res) => {
       LEFT JOIN video_rating_stats vrs ON vrs.video_id = v.id
       WHERE v.user_id = $1
         AND ($2::boolean = true OR v.visibility = 'public')
+        AND ($3::text = '' OR v.asset_scope = $3::text)
+        AND ($4::text = '' OR $4::text = 'all' OR v.media_type = $4::text)
       ORDER BY ${orderBy}
       LIMIT 200
       `,
-      [channelUserId, includeAll]
+      [
+        channelUserId,
+        includeAll,
+        scope || "",        // "" means no filter
+        type || "",         // "" means no filter
+      ]
     );
 
     // Return the SAME shape used everywhere else (thumbUrl + playbackUrl, etc.)
@@ -1244,7 +1273,11 @@ app.get("/api/videos", async (req, res) => {
         "COALESCE(vrs.rating_avg, 0) DESC, COALESCE(vrs.rating_count, 0) DESC, v.created_at DESC";
 
     // Build WHERE dynamically but safely
-    const where = [`v.visibility = 'public'`];
+    const where = [
+      `v.visibility = 'public'`,
+      `v.asset_scope = 'public'`,
+      `v.media_type = 'video'`,
+    ];
     const params = [];
     let i = 1;
 
@@ -1318,27 +1351,26 @@ app.get("/api/videos/:id", async (req, res) => {
   try {
     const v = await fetchVideoById(req.params.id);
     if (!v) return res.status(404).json({ error: "Not found" });
+
+    const requesterId = req.user?.id ? Number(req.user.id) : null;
+    const ownerId = Number(v.user_id);
+
+    const isOwner = requesterId != null && requesterId === ownerId;
+
+    // Library assets are owner-only
+    if (v.asset_scope === "library" && !isOwner) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    // Private/unlisted are owner-only
+    if (v.visibility !== "public" && !isOwner) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
     res.json(await toApiVideo(req, v));
   } catch (e) {
     console.error("GET /api/videos/:id error:", e);
     res.status(500).json({ error: "Failed to load video" });
-  }
-});
-
-app.get("/api/categories", async (_req, res) => {
-  try {
-    const result = await pool.query(
-      `
-      SELECT DISTINCT category
-      FROM videos
-      WHERE visibility = 'public'
-      ORDER BY category ASC
-      `
-    );
-    res.json(result.rows.map((r) => r.category));
-  } catch (e) {
-    console.error("GET /api/categories error:", e);
-    res.status(500).json({ error: "Failed to load categories" });
   }
 });
 
@@ -1380,6 +1412,25 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     const visibility = String(req.body?.visibility || "public").toLowerCase();
     const tagsRaw = String(req.body?.tags || "");
 
+    const mediaType = String(req.body?.mediaType || "video").toLowerCase().trim();   // video|audio
+    const assetScope = String(req.body?.assetScope || "public").toLowerCase().trim(); // public|library
+
+    const allowedMedia = new Set(["video", "audio"]);
+    const allowedScope = new Set(["public", "library"]);
+
+    if (!allowedMedia.has(mediaType)) {
+      log("FAIL validation: bad mediaType", { mediaType });
+      return res.status(400).json({ error: "mediaType must be video or audio" });
+    }
+    if (!allowedScope.has(assetScope)) {
+      log("FAIL validation: bad assetScope", { assetScope });
+      return res.status(400).json({ error: "assetScope must be public or library" });
+    }
+
+    // force private if library
+    const effectiveVisibility = assetScope === "library" ? "private" : visibility;
+
+
     if (!title) {
       log("FAIL validation: missing title");
       return res.status(400).json({ error: "Title is required" });
@@ -1415,38 +1466,40 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     const thumbPath = path.join(THUMB_DIR, thumbName);
 
     let storedThumb = "placeholder.jpg";
-    log("THUMB start", { thumbName, thumbPath });
 
-    const tThumb = Date.now();
-    try {
-      await generateThumbnailHalfwayWithFallback(req.file.path, thumbPath);
-      storedThumb = thumbName;
-      log("THUMB ok", { ms: Date.now() - tThumb, storedThumb });
-    } catch (e) {
-      log("THUMB failed, using placeholder", {
-        ms: Date.now() - tThumb,
-        error: e?.message,
-      });
+    if (mediaType === "video") {
+      const base = path.parse(req.file.filename).name;
+      const thumbName = `${base}.jpg`;
+      const thumbPath = path.join(THUMB_DIR, thumbName);
+
+      log("THUMB start", { thumbName, thumbPath });
+      const tThumb = Date.now();
+
       try {
-        if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
-      } catch (cleanupErr) {
-        log("THUMB cleanup failed", { error: cleanupErr?.message });
+        await generateThumbnailHalfwayWithFallback(req.file.path, thumbPath);
+        storedThumb = thumbName;
+        log("THUMB ok", { ms: Date.now() - tThumb, storedThumb });
+      } catch (e) {
+        log("THUMB failed, using placeholder", { ms: Date.now() - tThumb, error: e?.message });
+        try { if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath); } catch {}
       }
+    } else {
+      log("THUMB skipped (audio)");
     }
 
     // What we store in DB (local filename or S3 key)
     let storedFilename = req.file.filename;
 
-    // ---------- AWS pipeline (NO HLS for now) ----------
+
     // ---------- AWS pipeline (HLS) ----------
   if (VIDEO_SOURCE === "aws") {
-    if (!process.env.S3_UPLOADS_BUCKET) {
-      throw new Error("Missing env S3_UPLOADS_BUCKET while VIDEO_SOURCE=aws");
-    }
+  if (!process.env.S3_UPLOADS_BUCKET) {
+    throw new Error("Missing env S3_UPLOADS_BUCKET while VIDEO_SOURCE=aws");
+  }
 
-    const bucket = process.env.S3_UPLOADS_BUCKET;
+  const bucket = process.env.S3_UPLOADS_BUCKET;
 
-    // Build a stable folder per uploaded file
+  if (mediaType === "video") {
     const base = path.parse(req.file.filename).name;
     const hlsOutDir = path.join(DATA_ROOT, "hls", `${userId}`, base);
 
@@ -1455,33 +1508,42 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     await generateHls(req.file.path, hlsOutDir);
     log("HLS transcode ok", { ms: Date.now() - tHls });
 
-    // Upload HLS folder to S3
     const hlsKeyPrefix = `hls/${userId}/${base}`;
     log("S3 HLS upload start", { bucket, keyPrefix: hlsKeyPrefix });
 
     const tS3 = Date.now();
-    await uploadDirToS3({
-      bucket,
-      dirPath: hlsOutDir,
-      keyPrefix: hlsKeyPrefix,
-    });
+    await uploadDirToS3({ bucket, dirPath: hlsOutDir, keyPrefix: hlsKeyPrefix });
     log("S3 HLS upload ok", { ms: Date.now() - tS3 });
 
-    // Store master playlist key in DB (your existing playbackUrl logic will use this)
     storedFilename = `${hlsKeyPrefix}/master.m3u8`;
 
-    // Upload thumb to S3 assets bucket (same as before)
-    if (
-      storedThumb !== "placeholder.jpg" &&
-      fs.existsSync(thumbPath) &&
-      process.env.S3_ASSETS_BUCKET
-    ) {
-      log("S3 thumb upload start", {
-        bucket: process.env.S3_ASSETS_BUCKET,
-        key: storedThumb,
-      });
+    // cleanup hlsOutDir
+    try { if (fs.existsSync(hlsOutDir)) fs.rmSync(hlsOutDir, { recursive: true, force: true }); } catch {}
+  } else {
+    // AUDIO: upload raw file (no HLS yet)
+    const audioKey = `uploads/${userId}/${req.file.filename}`;
+    log("S3 audio upload start", { bucket, key: audioKey });
 
-      const tS3Thumb = Date.now();
+    const tS3Audio = Date.now();
+    await uploadFileToS3({
+      bucket,
+      key: audioKey,
+      filePath: req.file.path,
+      contentType: req.file.mimetype || "application/octet-stream",
+    });
+    log("S3 audio upload ok", { ms: Date.now() - tS3Audio });
+
+    storedFilename = audioKey;
+  }
+
+  // Upload thumb to S3 (only if we generated one)
+  if (
+    storedThumb !== "placeholder.jpg" &&
+    process.env.S3_ASSETS_BUCKET
+  ) {
+    const thumbPath = path.join(THUMB_DIR, storedThumb);
+    if (fs.existsSync(thumbPath)) {
+      log("S3 thumb upload start", { bucket: process.env.S3_ASSETS_BUCKET, key: storedThumb });
       try {
         await uploadFileToS3({
           bucket: process.env.S3_ASSETS_BUCKET,
@@ -1489,36 +1551,46 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
           filePath: thumbPath,
           contentType: "image/jpeg",
         });
-        log("S3 thumb upload ok", { ms: Date.now() - tS3Thumb });
+        log("S3 thumb upload ok");
       } catch (e) {
-        log("S3 thumb upload failed", { ms: Date.now() - tS3Thumb, error: e?.message });
+        log("S3 thumb upload failed", { error: e?.message });
       }
-    }
 
-    // Cleanup local temp files
-    log("Cleanup start (local upload + local thumb + local hls)");
-    try { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
-    try { if (storedThumb !== "placeholder.jpg" && fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath); } catch {}
-    try { if (fs.existsSync(hlsOutDir)) fs.rmSync(hlsOutDir, { recursive: true, force: true }); } catch {}
-    log("Cleanup done");
+      try { fs.unlinkSync(thumbPath); } catch {}
+    }
   }
 
+  // Cleanup local uploaded file
+  try { if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path); } catch {}
+}
+
     // ---------- DB insert ----------
-    log("DB insert start", {
-      storedFilename,
-      storedThumb,
-      visibility,
-      tagsCount: tags.length,
-    });
+    log("DB insert start", { storedFilename, storedThumb, visibility: effectiveVisibility, mediaType, assetScope, tagsCount: tags.length });
     const tDb = Date.now();
 
     const ins = await pool.query(
       `
-      INSERT INTO videos (user_id, title, description, category, visibility, filename, thumb, duration_text, views, tags)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
+      INSERT INTO videos (
+        user_id, title, description, category, visibility,
+        media_type, asset_scope,
+        filename, thumb, duration_text, views, tags
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, $11)
       RETURNING id
       `,
-      [userId, title, description, category, visibility, storedFilename, storedThumb, null, tags]
+      [
+        userId,
+        title,
+        description,
+        category,
+        effectiveVisibility,
+        mediaType,
+        assetScope,
+        storedFilename,
+        storedThumb,
+        null,
+        tags,
+      ]
     );
 
     const insertedId = ins.rows[0].id;
@@ -1564,6 +1636,14 @@ app.use("/thumbs", express.static(THUMB_DIR));
 // Local streaming endpoint (only used when VIDEO_SOURCE=local)
 // -------------------------
 app.get("/videos/:id/stream", async (req, res) => {
+  
+  const requesterId = req.user?.id ? Number(req.user.id) : null;
+  const ownerId = Number(v.user_id);
+  const isOwner = requesterId != null && requesterId === ownerId;
+
+  if (v.asset_scope === "library" && !isOwner) return res.status(404).end("Not found");
+  if (v.visibility !== "public" && !isOwner) return res.status(404).end("Not found");
+  
   if (VIDEO_SOURCE !== "local") {
     return res.status(404).json({ error: "Streaming endpoint not used in this mode" });
   }
@@ -1580,7 +1660,12 @@ app.get("/videos/:id/stream", async (req, res) => {
   const range = req.headers.range;
 
   const ext = path.extname(filePath).toLowerCase();
-  const contentType = ext === ".mp4" ? "video/mp4" : "application/octet-stream";
+  const contentType =
+    ext === ".mp4" ? "video/mp4"
+    : ext === ".mp3" ? "audio/mpeg"
+    : ext === ".wav" ? "audio/wav"
+    : ext === ".m4a" ? "audio/mp4"
+    : "application/octet-stream";
 
   if (!range) {
     res.writeHead(200, {
