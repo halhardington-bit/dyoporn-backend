@@ -13,12 +13,6 @@ import {
 } from "@aws-sdk/client-s3";
 import { s3 } from "./aws/s3Client.js";
 
-console.log("[publish] HIT", {
-  origin: req.headers.origin,
-  userId: req.user?.id,
-  bodyKeys: Object.keys(req.body || {}),
-});
-
 function runCmd(cmd, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(cmd, args, { windowsHide: true });
@@ -182,7 +176,9 @@ function buildFilterVideoAndAudio({
   const safeTotal = Math.max(0.01, Number(totalDur) || 0);
 
   if (!audioClips.length) {
-    parts.push(`anullsrc=r=48000:cl=stereo,atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`);
+    parts.push(
+      `anullsrc=r=48000:cl=stereo,atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`
+    );
     return parts.join(";");
   }
 
@@ -205,9 +201,9 @@ function buildFilterVideoAndAudio({
     aLabels.push(`[a${k}]`);
   }
 
-    parts.push(
+  parts.push(
     `${aLabels.join("")}amix=inputs=${audioClips.length}:dropout_transition=0,` +
-    `atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`
+      `atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`
   );
 
   return parts.join(";");
@@ -306,6 +302,13 @@ export function registerGeneratePublish(app, deps = {}) {
   if (!uploadFileToS3) throw new Error("registerGeneratePublish: missing uploadFileToS3");
 
   app.post("/api/generate/publish", requireAuth, async (req, res) => {
+    // ✅ req exists here
+    console.log("[publish] HIT", {
+      origin: req.headers.origin,
+      userId: req.user?.id,
+      bodyKeys: Object.keys(req.body || {}),
+    });
+
     try {
       const userId = Number(req.user?.id);
       const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-export-"));
@@ -601,11 +604,9 @@ export function registerGeneratePublish(app, deps = {}) {
         cleanup();
         return res.status(500).json({ error: e?.message || "Failed to publish generated video" });
       }
-    
-    }
-     catch (e) {
-    console.error("[publish] FAIL", e?.stack || e);
-    return res.status(500).json({ error: e?.message || "Publish failed" });
+    } catch (e) {
+      console.error("[publish] FAIL", e?.stack || e);
+      return res.status(500).json({ error: e?.message || "Publish failed" });
     }
   });
 }
