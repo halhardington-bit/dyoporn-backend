@@ -56,10 +56,22 @@ const allowedOrigins = new Set(
 );
 
 
+function expandOrigin(s) {
+  const v = String(s || "").trim().replace(/\/$/, "");
+  if (!v) return [];
+
+  // If already has protocol, use as-is
+  if (/^https?:\/\//i.test(v)) return [v];
+
+  // Otherwise, accept it as a hostname and expand
+  return [`https://${v}`, `http://${v}`];
+}
+
 const explicitOrigins = new Set(
   (process.env.CLIENT_ORIGINS || "")
     .split(",")
-    .map((s) => s.trim().replace(/\r/g, "").replace(/\/$/, ""))
+    .flatMap(expandOrigin)
+    .map((s) => s.trim().replace(/\/$/, ""))
     .filter(Boolean)
 );
 
@@ -96,6 +108,8 @@ const corsOptions = {
     if (!origin) return cb(null, true);
 
     const o = origin.replace(/\/$/, "").replace(/\r/g, "");
+    const ok = explicitOrigins.has(o) || isAllowedVercelOrigin(o);
+    console.log("[CORS] origin:", origin, "=>", ok ? "ALLOW" : "BLOCK");
 
     // 1) allow explicit list (custom domains, etc)
     if (explicitOrigins.has(o)) return cb(null, true);
