@@ -5,7 +5,12 @@ import os from "os";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import { pipeline } from "stream/promises";
-import { GetObjectCommand } from "@aws-sdk/client-s3";
+import {
+  GetObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
 import { s3 } from "./aws/s3Client.js";
 
 function runCmd(cmd, args) {
@@ -30,71 +35,58 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function normTimeline(raw) {
+function normClips(raw, { kindDefault = null } = {}) {
   const arr = Array.isArray(raw) ? raw : [];
   return arr
     .map((c) => ({
+      kind: String(c.kind ?? kindDefault ?? "").trim().toLowerCase() || null, // "video" | "audio"
+      track: Number.isFinite(Number(c.track)) ? Number(c.track) : 0,
       videoId: String(c.videoId ?? c.id ?? ""),
       start: Number(c.start ?? 0),
       in: Number(c.in ?? 0),
       out: Number(c.out ?? 0),
+      gain: c.gain == null ? 1 : Number(c.gain),
     }))
     .filter(
       (c) =>
         c.videoId &&
         Number.isFinite(c.start) &&
         Number.isFinite(c.in) &&
-        Number.isFinite(c.out)
+        Number.isFinite(c.out) &&
+        c.out > c.in &&
+        c.start >= 0
     )
-    .filter((c) => c.out > c.in && c.start >= 0)
+    .map((c) => ({
+      ...c,
+      track: clamp(Number(c.track) || 0, 0, 10),
+      gain: Number.isFinite(c.gain) ? c.gain : 1,
+    }))
     .sort((a, b) => a.start - b.start);
 }
 
-// Option A: concat clips back-to-back (ignores gaps)
-// Always produces BOTH video + audio for each clip.
-// If an input has no audio, we synthesize silence for that clip duration.
-function buildFilterForConcat(clips, audioFlags) {
-  const parts = [];
-  const inputs = []; // must be interleaved: [v0][a0][v1][a1]...
-
-  for (let i = 0; i < clips.length; i++) {
-    const c = clips[i];
-    const dur = Math.max(0, c.out - c.in);
-
-    // video
-    parts.push(
-      `[${i}:v]trim=start=${c.in}:duration=${dur},setpts=PTS-STARTPTS[v${i}]`
-    );
-
-    // audio (real or silence)
-    if (audioFlags?.[i]) {
-      parts.push(
-        `[${i}:a]atrim=start=${c.in}:duration=${dur},asetpts=PTS-STARTPTS[a${i}]`
-      );
-    } else {
-      parts.push(
-        `aevalsrc=0:d=${dur}[a${i}]`
-      );
-    }
-
-    // IMPORTANT: interleave in pairs
-    inputs.push(`[v${i}]`, `[a${i}]`);
+function timelineDurationSeconds(videoClips) {
+  let maxEnd = 0;
+  for (const c of videoClips) {
+    const end =
+      (Number(c.start) || 0) +
+      ((Number(c.out) || 0) - (Number(c.in) || 0));
+    if (end > maxEnd) maxEnd = end;
   }
-
-  parts.push(`${inputs.join("")}concat=n=${clips.length}:v=1:a=1[vout][aout]`);
-  return parts.join(";");
+  return Math.max(0, maxEnd);
 }
 
-
-
-async function hasAudioStream(filePath) {
+async function hasAudioStream(inputPath) {
   try {
     const { out } = await runCmd("ffprobe", [
-      "-v", "error",
-      "-select_streams", "a:0",
-      "-show_entries", "stream=codec_type",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      filePath,
+      "-v",
+      "error",
+      "-select_streams",
+      "a:0",
+      "-show_entries",
+      "stream=codec_type",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      inputPath,
     ]);
     return String(out || "").trim() === "audio";
   } catch {
@@ -102,13 +94,202 @@ async function hasAudioStream(filePath) {
   }
 }
 
+async function extractThumbnail({ inputPath, outPath, atSeconds }) {
+  const t = Math.max(0, Number(atSeconds) || 0);
 
+  await runCmd("ffmpeg", [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-ss",
+    String(t),
+    "-i",
+    inputPath,
+    "-frames:v",
+    "1",
+    "-vf",
+    "scale=1280:-2",
+    "-q:v",
+    "2",
+    outPath,
+  ]);
+}
 
 async function downloadS3ToFile({ bucket, key, outPath }) {
   const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
   if (!resp?.Body) throw new Error(`S3 download failed for ${key}`);
   await pipeline(resp.Body, fs.createWriteStream(outPath));
   return outPath;
+}
+
+async function downloadS3PrefixToDir({ bucket, prefix, outDir }) {
+  fs.mkdirSync(outDir, { recursive: true });
+  let ContinuationToken = undefined;
+
+  while (true) {
+    const listed = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken })
+    );
+
+    const items = listed?.Contents || [];
+    for (const obj of items) {
+      const k = obj.Key;
+      if (!k || k.endsWith("/")) continue;
+
+      const rel = k.slice(prefix.length);
+      const localPath = path.join(outDir, rel);
+      fs.mkdirSync(path.dirname(localPath), { recursive: true });
+
+      await downloadS3ToFile({ bucket, key: k, outPath: localPath });
+    }
+
+    if (!listed.IsTruncated) break;
+    ContinuationToken = listed.NextContinuationToken;
+  }
+}
+
+function buildFilterVideoAndAudio({
+  videoClips,
+  audioClips,
+  idToInputIndex,
+  audioPresentByInputIndex,
+  totalDur,
+}) {
+  const parts = [];
+
+  // VIDEO: concat in order (ignores gaps)
+  const vLabels = [];
+  for (let j = 0; j < videoClips.length; j++) {
+    const c = videoClips[j];
+    const idx = idToInputIndex.get(String(c.videoId));
+    const dur = Math.max(0, Number(c.out) - Number(c.in));
+
+    parts.push(
+      `[${idx}:v]trim=start=${c.in}:duration=${dur},setpts=PTS-STARTPTS[v${j}]`
+    );
+    vLabels.push(`[v${j}]`);
+  }
+  parts.push(`${vLabels.join("")}concat=n=${videoClips.length}:v=1:a=0[vout]`);
+
+  // AUDIO: layered mix positioned by start
+  const safeTotal = Math.max(0.01, Number(totalDur) || 0);
+
+  if (!audioClips.length) {
+    parts.push(`anullsrc=r=48000:cl=stereo,atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`);
+    return parts.join(";");
+  }
+
+  const aLabels = [];
+  for (let k = 0; k < audioClips.length; k++) {
+    const c = audioClips[k];
+    const idx = idToInputIndex.get(String(c.videoId));
+    const dur = Math.max(0, Number(c.out) - Number(c.in));
+    const delayMs = Math.max(0, Math.round((Number(c.start) || 0) * 1000));
+    const gain = Number.isFinite(Number(c.gain)) ? Number(c.gain) : 1;
+
+    if (audioPresentByInputIndex.get(idx)) {
+      parts.push(
+        `[${idx}:a]atrim=start=${c.in}:duration=${dur},asetpts=PTS-STARTPTS,` +
+          `volume=${gain},adelay=${delayMs}|${delayMs}[a${k}]`
+      );
+    } else {
+      parts.push(`aevalsrc=0:d=${dur},adelay=${delayMs}|${delayMs}[a${k}]`);
+    }
+    aLabels.push(`[a${k}]`);
+  }
+
+  parts.push(
+    `${aLabels.join("")}amix=inputs=${audioClips.length}:normalize=0:dropout_transition=0,` +
+      `atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`
+  );
+
+  return parts.join(";");
+}
+
+function splitTimeline(timeline) {
+  const all = normClips(timeline);
+  const videoClips = all
+    .filter((c) => (c.kind || "video") === "video")
+    .map((c) => ({ ...c, kind: "video", track: 0 }));
+  const audioClips = all
+    .filter((c) => c.kind === "audio")
+    .map((c) => ({ ...c, kind: "audio" }));
+  return { videoClips, audioClips };
+}
+
+function contentTypeForExt(ext) {
+  const e = String(ext || "").toLowerCase();
+  if (e === ".m3u8") return "application/vnd.apple.mpegurl";
+  if (e === ".ts") return "video/mp2t";
+  if (e === ".mp4") return "video/mp4";
+  if (e === ".m4s") return "video/iso.segment";
+  if (e === ".jpg" || e === ".jpeg") return "image/jpeg";
+  if (e === ".png") return "image/png";
+  return "application/octet-stream";
+}
+
+function listFilesRecursive(dir) {
+  const out = [];
+  const stack = [dir];
+  while (stack.length) {
+    const cur = stack.pop();
+    const entries = fs.readdirSync(cur, { withFileTypes: true });
+    for (const ent of entries) {
+      const p = path.join(cur, ent.name);
+      if (ent.isDirectory()) stack.push(p);
+      else if (ent.isFile()) out.push(p);
+    }
+  }
+  return out;
+}
+
+async function uploadDirToS3({ uploadFileToS3, bucket, localDir, keyPrefix }) {
+  const files = listFilesRecursive(localDir);
+  for (const filePath of files) {
+    const rel = path.relative(localDir, filePath).split(path.sep).join("/");
+    const key = `${keyPrefix.replace(/\/+$/g, "")}/${rel}`;
+    const ext = path.extname(filePath);
+    await uploadFileToS3({
+      bucket,
+      key,
+      filePath,
+      contentType: contentTypeForExt(ext),
+    });
+  }
+}
+
+// Dedicated uploader for ASSETS bucket (fixes “wrong endpoint” when assets is in another region)
+function makeAssetsS3Client() {
+  const region =
+    process.env.S3_ASSETS_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_DEFAULT_REGION;
+
+  if (!region) {
+    throw new Error("Missing env S3_ASSETS_REGION (or AWS_REGION) for assets bucket uploads");
+  }
+
+  // If you use a custom endpoint (rare), set S3_ASSETS_ENDPOINT.
+  const endpoint = process.env.S3_ASSETS_ENDPOINT || undefined;
+
+  return new S3Client({
+    region,
+    ...(endpoint ? { endpoint } : {}),
+  });
+}
+
+async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
+  const Body = fs.createReadStream(filePath);
+  await assetsS3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body,
+      ContentType: contentType,
+      CacheControl: "public, max-age=31536000, immutable",
+    })
+  );
 }
 
 export function registerGeneratePublish(app, deps = {}) {
@@ -129,11 +310,8 @@ export function registerGeneratePublish(app, deps = {}) {
 
     const cleanup = () => {
       try {
-        // rm recursive (Node 14+)
         fs.rmSync(tmpRoot, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
+      } catch {}
     };
 
     try {
@@ -143,91 +321,125 @@ export function registerGeneratePublish(app, deps = {}) {
         tags = "",
         visibility = "public",
         timelineName = "Timeline",
+
         timeline,
+        videoClips,
+        audioClips,
       } = req.body || {};
 
-      const clips = normTimeline(timeline);
+      let vClips = [];
+      let aClips = [];
+
+      if (Array.isArray(timeline)) {
+        const split = splitTimeline(timeline);
+        vClips = split.videoClips;
+        aClips = split.audioClips;
+      } else {
+        vClips = normClips(videoClips, { kindDefault: "video" }).map((c) => ({
+          ...c,
+          kind: "video",
+          track: 0,
+        }));
+        aClips = normClips(audioClips, { kindDefault: "audio" }).map((c) => ({
+          ...c,
+          kind: "audio",
+        }));
+      }
 
       if (!String(title || "").trim()) {
         cleanup();
         return res.status(400).json({ error: "Title is required" });
       }
-      if (!clips.length) {
+      if (!vClips.length) {
         cleanup();
-        return res.status(400).json({ error: "Timeline is empty" });
+        return res.status(400).json({ error: "Video lane is empty" });
       }
 
-      // AWS-only
-      if (!process.env.S3_UPLOADS_BUCKET) {
+      const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
+      if (!uploadsBucket) {
         cleanup();
         return res.status(500).json({ error: "Missing env S3_UPLOADS_BUCKET" });
       }
 
-      // Fetch filenames/keys for the clip IDs
-      const ids = clips.map((c) => c.videoId);
+      const assetsBucket = process.env.S3_ASSETS_BUCKET;
+      if (!assetsBucket) {
+        cleanup();
+        return res.status(500).json({ error: "Missing env S3_ASSETS_BUCKET" });
+      }
+
+      // unique sources across video + audio
+      const allIds = Array.from(new Set([...vClips, ...aClips].map((c) => String(c.videoId))));
 
       const q = await pool.query(
-        `
-        SELECT id, filename
-        FROM videos
-        WHERE id::text = ANY($1::text[])
-        `,
-        [ids]
+        `SELECT id, filename FROM videos WHERE id::text = ANY($1::text[])`,
+        [allIds]
       );
 
-      const byId = new Map(q.rows.map((r) => [String(r.id), r]));
-      for (const c of clips) {
-        if (!byId.has(String(c.videoId))) {
-          cleanup();
-          return res
-            .status(400)
-            .json({ error: `Unknown clip videoId ${c.videoId}` });
-        }
-      }
+      const byId = new Map(q.rows.map((r) => [String(r.id), String(r.filename || "")]));
 
-      // Download each source MP4 locally for ffmpeg
-      const inputPaths = [];
-      for (let i = 0; i < clips.length; i++) {
-        const c = clips[i];
-        const row = byId.get(String(c.videoId));
-
-        const key = String(row.filename || "");
+      for (const id of allIds) {
+        const key = byId.get(id);
         if (!key) {
           cleanup();
-          return res.status(400).json({ error: `Missing filename for ${c.videoId}` });
+          return res.status(400).json({ error: `Unknown/missing source for videoId ${id}` });
         }
-
-        const localName = `src-${i}-${c.videoId}.mp4`;
-        const localPath = path.join(inputDir, localName);
-
-        await downloadS3ToFile({
-          bucket: process.env.S3_UPLOADS_BUCKET,
-          key,
-          outPath: localPath,
-        });
-
-        inputPaths.push(localPath);
       }
 
-      // Output mp4
-      const outName = `export-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.mp4`;
-      const outPath = path.join(outDir, outName);
+      // download each unique source once
+      const inputPaths = [];
+      const idToInputIndex = new Map();
 
-      // ffmpeg concat
-      const audioFlags = await Promise.all(inputPaths.map((p) => hasAudioStream(p)));
-      const filter = buildFilterForConcat(clips, audioFlags);
+      for (let i = 0; i < allIds.length; i++) {
+        const id = allIds[i];
+        const key = byId.get(id);
 
-      console.log("\n=== FFMPEG FILTER ===\n");
-      console.log(filter);
-      console.log("\n=====================\n");
-      
+        if (key.endsWith("/master.m3u8")) {
+          const prefix = key.replace(/master\.m3u8$/i, "");
+          const localHlsDir = path.join(inputDir, `hls-${i}-${id}`);
+          await downloadS3PrefixToDir({ bucket: uploadsBucket, prefix, outDir: localHlsDir });
 
+          const localMaster = path.join(localHlsDir, "master.m3u8");
+          if (!fs.existsSync(localMaster)) {
+            cleanup();
+            return res.status(500).json({ error: `Downloaded HLS missing master.m3u8 for ${id}` });
+          }
 
+          idToInputIndex.set(id, inputPaths.length);
+          inputPaths.push(localMaster);
+        } else {
+          const ext = path.extname(key) || ".mp4";
+          const localPath = path.join(inputDir, `src-${i}-${id}${ext}`);
+          await downloadS3ToFile({ bucket: uploadsBucket, key, outPath: localPath });
 
-      const args = [];
-      for (const p of inputPaths) args.push("-i", p);
+          idToInputIndex.set(id, inputPaths.length);
+          inputPaths.push(localPath);
+        }
+      }
 
-      args.push(
+      // which inputs have audio streams?
+      const audioPresentByInputIndex = new Map();
+      for (let i = 0; i < inputPaths.length; i++) {
+        audioPresentByInputIndex.set(i, await hasAudioStream(inputPaths[i]));
+      }
+
+      const totalDur = timelineDurationSeconds(vClips);
+
+      const filter = buildFilterVideoAndAudio({
+        videoClips: vClips,
+        audioClips: aClips,
+        idToInputIndex,
+        audioPresentByInputIndex,
+        totalDur,
+      });
+
+      // 1) Render MP4 intermediate
+      const mp4Name = `export-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.mp4`;
+      const mp4Path = path.join(outDir, mp4Name);
+
+      const mp4Args = [];
+      for (const p of inputPaths) mp4Args.push("-i", p);
+
+      mp4Args.push(
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -244,28 +456,102 @@ export function registerGeneratePublish(app, deps = {}) {
         "veryfast",
         "-crf",
         "22",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "192k",
         "-movflags",
         "+faststart",
-        outPath
+        mp4Path
       );
 
-      await runCmd("ffmpeg", args);
+      await runCmd("ffmpeg", mp4Args);
 
-      // Upload exported mp4
-      const uploadKey = `uploads/${userId}/${outName}`;
+      // 2) Create HLS VOD from MP4
+      const hlsBase = `gen-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+      const hlsLocalDir = path.join(outDir, `hls-${hlsBase}`);
+      fs.mkdirSync(hlsLocalDir, { recursive: true });
 
-      await uploadFileToS3({
-        bucket: process.env.S3_UPLOADS_BUCKET,
-        key: uploadKey,
-        filePath: outPath,
-        contentType: "video/mp4",
+      const localMaster = path.join(hlsLocalDir, "master.m3u8");
+      const localSegPattern = path.join(hlsLocalDir, "seg-%05d.ts");
+
+      await runCmd("ffmpeg", [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        mp4Path,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-f",
+        "hls",
+        "-hls_time",
+        "4",
+        "-hls_playlist_type",
+        "vod",
+        "-hls_segment_filename",
+        localSegPattern,
+        localMaster,
+      ]);
+
+      if (!fs.existsSync(localMaster)) {
+        throw new Error("HLS export failed: master.m3u8 was not created");
+      }
+
+      // 3) Extract thumbnail from MP4 (middle frame)
+      const safeTotal = Math.max(0.01, Number(totalDur) || 0);
+      const mid = clamp(safeTotal / 2, 0, Math.max(0, safeTotal - 0.1));
+
+      const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
+      const thumbPath = path.join(outDir, thumbName);
+
+      await extractThumbnail({
+        inputPath: mp4Path,
+        outPath: thumbPath,
+        atSeconds: mid,
       });
 
-      // DB insert
+      if (!fs.existsSync(thumbPath) || fs.statSync(thumbPath).size < 1000) {
+        throw new Error("Thumbnail extraction failed (thumb missing or too small)");
+      }
+
+      // 4) Upload HLS folder to UPLOADS bucket
+      const hlsKeyPrefix = `hls/${userId}/${hlsBase}`;
+      await uploadDirToS3({
+        uploadFileToS3,
+        bucket: uploadsBucket,
+        localDir: hlsLocalDir,
+        keyPrefix: hlsKeyPrefix,
+      });
+
+      // 5) Upload thumb to ASSETS bucket (separate client/region)
+      const thumbKey = `thumbs/${userId}/${thumbName}`;
+
+      const assetsS3 = makeAssetsS3Client();
+      await uploadFileToAssetsBucket({
+        assetsS3,
+        bucket: assetsBucket,
+        key: thumbKey,
+        filePath: thumbPath,
+        contentType: "image/jpeg",
+      });
+
+      // 6) Insert DB row (filename points to HLS master)
+      const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
+
       const allowedVis = new Set(["public", "private", "unlisted"]);
       const vis = allowedVis.has(String(visibility).toLowerCase())
         ? String(visibility).toLowerCase()
@@ -283,8 +569,12 @@ export function registerGeneratePublish(app, deps = {}) {
 
       const ins = await pool.query(
         `
-        INSERT INTO videos (user_id, title, description, category, visibility, filename, thumb, duration_text, views, tags)
-        VALUES ($1, $2, $3, 'Other', $4, $5, 'placeholder.jpg', NULL, 0, $6)
+        INSERT INTO videos (
+          user_id, title, description, category, visibility,
+          media_type, asset_scope,
+          filename, thumb, duration_text, views, tags
+        )
+        VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, NULL, 0, $7)
         RETURNING id
         `,
         [
@@ -292,24 +582,18 @@ export function registerGeneratePublish(app, deps = {}) {
           String(title).trim(),
           String(description || "").trim(),
           vis,
-          uploadKey,
+          hlsMasterKey,
+          thumbKey,
           tagsArr,
         ]
       );
 
       cleanup();
-
-      return res.json({
-        ok: true,
-        videoId: ins.rows[0].id,
-        timelineName,
-      });
+      return res.json({ ok: true, videoId: ins.rows[0].id, timelineName });
     } catch (e) {
       console.error("POST /api/generate/publish error:", e);
       cleanup();
-      return res
-        .status(500)
-        .json({ error: e?.message || "Failed to publish generated video" });
+      return res.status(500).json({ error: e?.message || "Failed to publish generated video" });
     }
   });
 }

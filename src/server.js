@@ -1412,8 +1412,27 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     const visibility = String(req.body?.visibility || "public").toLowerCase();
     const tagsRaw = String(req.body?.tags || "");
 
-    const mediaType = String(req.body?.mediaType || "video").toLowerCase().trim();   // video|audio
-    const assetScope = String(req.body?.assetScope || "public").toLowerCase().trim(); // public|library
+    let mediaType = String(req.body?.mediaType || "").toLowerCase().trim(); // don't default yet
+    const assetScope = String(req.body?.assetScope || "public").toLowerCase().trim();
+
+    // ✅ infer mediaType from the uploaded file if not provided (or wrong)
+    const mime = String(req.file?.mimetype || "");
+    const ext = path.extname(req.file?.originalname || "").toLowerCase();
+
+    const looksAudio =
+      mime.startsWith("audio/") || [".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".opus"].includes(ext);
+    const looksVideo =
+      mime.startsWith("video/") || [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v", ".mpeg", ".mpg"].includes(ext);
+
+    if (!mediaType) {
+      mediaType = looksAudio ? "audio" : "video"; // fallback
+    } else {
+      // if user says "video" but it's clearly audio, correct it
+      if (mediaType === "video" && looksAudio && !looksVideo) mediaType = "audio";
+      if (mediaType === "audio" && looksVideo && !looksAudio) mediaType = "video";
+    }
+
+    log("mediaType resolved", { mediaType, mimetype: req.file?.mimetype, originalname: req.file?.originalname });
 
     const allowedMedia = new Set(["video", "audio"]);
     const allowedScope = new Set(["public", "library"]);
@@ -1636,64 +1655,70 @@ app.use("/thumbs", express.static(THUMB_DIR));
 // Local streaming endpoint (only used when VIDEO_SOURCE=local)
 // -------------------------
 app.get("/videos/:id/stream", async (req, res) => {
-  
-  const requesterId = req.user?.id ? Number(req.user.id) : null;
-  const ownerId = Number(v.user_id);
-  const isOwner = requesterId != null && requesterId === ownerId;
+  try {
+    // If you're not using local streaming, bail early.
+    if (VIDEO_SOURCE !== "local") {
+      return res.status(404).json({ error: "Streaming endpoint not used in this mode" });
+    }
 
-  if (v.asset_scope === "library" && !isOwner) return res.status(404).end("Not found");
-  if (v.visibility !== "public" && !isOwner) return res.status(404).end("Not found");
-  
-  if (VIDEO_SOURCE !== "local") {
-    return res.status(404).json({ error: "Streaming endpoint not used in this mode" });
-  }
+    const videoId = String(req.params.id || "");
+    const v = await fetchVideoById(videoId);
+    if (!v) return res.status(404).end("Not found");
 
-  const videoId = req.params.id;
-  const v = await fetchVideoById(videoId);
-  if (!v) return res.status(404).end("Not found");
+    // Permissions (library/private/unlisted are owner-only)
+    const requesterId = req.user?.id != null ? Number(req.user.id) : null;
+    const ownerId = Number(v.user_id);
+    const isOwner = requesterId != null && requesterId === ownerId;
 
-  const filePath = path.join(VIDEO_DIR, v.filename);
-  if (!fs.existsSync(filePath)) return res.status(404).end("Missing file");
+    if (v.asset_scope === "library" && !isOwner) return res.status(404).end("Not found");
+    if (v.visibility !== "public" && !isOwner) return res.status(404).end("Not found");
 
-  const stat = fs.statSync(filePath);
-  const fileSize = stat.size;
-  const range = req.headers.range;
+    const filePath = path.join(VIDEO_DIR, v.filename);
+    if (!fs.existsSync(filePath)) return res.status(404).end("Missing file");
 
-  const ext = path.extname(filePath).toLowerCase();
-  const contentType =
-    ext === ".mp4" ? "video/mp4"
-    : ext === ".mp3" ? "audio/mpeg"
-    : ext === ".wav" ? "audio/wav"
-    : ext === ".m4a" ? "audio/mp4"
-    : "application/octet-stream";
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
 
-  if (!range) {
-    res.writeHead(200, {
-      "Content-Length": fileSize,
+    const ext = path.extname(filePath).toLowerCase();
+    const contentType =
+      ext === ".mp4" ? "video/mp4"
+      : ext === ".mp3" ? "audio/mpeg"
+      : ext === ".wav" ? "audio/wav"
+      : ext === ".m4a" ? "audio/mp4"
+      : "application/octet-stream";
+
+    if (!range) {
+      res.writeHead(200, {
+        "Content-Length": fileSize,
+        "Content-Type": contentType,
+      });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+    if (start >= fileSize) {
+      res.status(416).set("Content-Range", `bytes */${fileSize}`).end();
+      return;
+    }
+
+    const chunkSize = end - start + 1;
+    res.writeHead(206, {
+      "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunkSize,
       "Content-Type": contentType,
     });
-    fs.createReadStream(filePath).pipe(res);
-    return;
+
+    fs.createReadStream(filePath, { start, end }).pipe(res);
+  } catch (e) {
+    console.error("GET /videos/:id/stream error:", e);
+    res.status(500).json({ error: "Stream failed" });
   }
-
-  const parts = range.replace(/bytes=/, "").split("-");
-  const start = parseInt(parts[0], 10);
-  const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-
-  if (start >= fileSize) {
-    res.status(416).set("Content-Range", `bytes */${fileSize}`).end();
-    return;
-  }
-
-  const chunkSize = end - start + 1;
-  res.writeHead(206, {
-    "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-    "Accept-Ranges": "bytes",
-    "Content-Length": chunkSize,
-    "Content-Type": contentType,
-  });
-
-  fs.createReadStream(filePath, { start, end }).pipe(res);
 });
 
 // -------------------------
