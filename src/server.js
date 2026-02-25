@@ -59,7 +59,7 @@ const allowedOrigins = new Set(
 const explicitOrigins = new Set(
   (process.env.CLIENT_ORIGINS || "")
     .split(",")
-    .map((s) => s.trim().replace(/\/$/, ""))
+    .map((s) => s.trim().replace(/\r/g, "").replace(/\/$/, ""))
     .filter(Boolean)
 );
 
@@ -88,9 +88,14 @@ function isAllowedVercelOrigin(origin) {
 
 const corsOptions = {
   origin: (origin, cb) => {
+
+    console.log("[CORS] origin:", JSON.stringify(origin));
+    console.log("[CORS] explicit size:", explicitOrigins.size);
+    console.log("[CORS] explicit has:", origin ? explicitOrigins.has(origin.replace(/\/$/, "")) : null);
+
     if (!origin) return cb(null, true);
 
-    const o = origin.replace(/\/$/, "");
+    const o = origin.replace(/\/$/, "").replace(/\r/g, "");
 
     // 1) allow explicit list (custom domains, etc)
     if (explicitOrigins.has(o)) return cb(null, true);
