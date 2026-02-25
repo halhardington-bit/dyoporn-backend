@@ -63,6 +63,9 @@ const explicitOrigins = new Set(
     .filter(Boolean)
 );
 
+console.log("CLIENT_ORIGINS raw:", process.env.CLIENT_ORIGINS);
+console.log("CORS explicitOrigins:", [...explicitOrigins]);
+
 function isAllowedVercelOrigin(origin) {
   try {
     const { hostname, protocol } = new URL(origin);
