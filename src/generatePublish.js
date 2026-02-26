@@ -335,9 +335,11 @@ function buildFilterVideoAndAudio({
       `[${idx}:v]` +
         `trim=start=${c.in}:duration=${dur},` +
         `setpts=PTS-STARTPTS,` +
+        `fps=30,` +
         `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,` +
         `pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,` +
-        `setsar=1` +
+        `setsar=1,` +
+        `tpad=stop_mode=clone:stop_duration=0.1` +   // <— key
         `[v${j}]`
     );
     vLabels.push(`[v${j}]`);
@@ -366,8 +368,13 @@ function buildFilterVideoAndAudio({
 
     if (audioPresentByInputIndex.get(idx)) {
       parts.push(
-        `[${idx}:a]atrim=start=${c.in}:duration=${dur},asetpts=PTS-STARTPTS,` +
-          `volume=${gain},adelay=${delayMs}|${delayMs}[a${k}]`
+        `[${idx}:a]` +
+          `atrim=start=${c.in}:duration=${dur},` +
+          `asetpts=PTS-STARTPTS,` +
+          `volume=${gain},` +
+          `adelay=${delayMs}|${delayMs},` +
+          `apad,atrim=0:${dur}` +     // <— key
+          `[a${k}]`
       );
     } else {
       parts.push(`aevalsrc=0:d=${dur},adelay=${delayMs}|${delayMs}[a${k}]`);
@@ -638,44 +645,37 @@ export function registerGeneratePublish(app, deps = {}) {
 
       // Build args: inputs + filtergraph + map + HLS output
       const hlsArgs = [];
-      for (const p of inputPaths) hlsArgs.push("-i", p);
+      for (const p of inputPaths) {
+        if (String(p).endsWith(".m3u8")) {
+          hlsArgs.push(
+            "-protocol_whitelist", "file,crypto,data",
+            "-allowed_extensions", "ALL",
+            "-fflags", "+genpts",
+            "-i", p
+          );
+        } else {
+          hlsArgs.push("-i", p);
+        }
+      }
 
       hlsArgs.push(
         "-y",
         "-hide_banner",
-        "-loglevel",
-        "error",
-        "-filter_complex",
-        filter,
-        "-map",
-        "[vout]",
-        "-map",
-        "[aout]",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "22",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-
-        // HLS options
-        "-f",
-        "hls",
-        "-hls_time",
-        "4",
-        "-hls_playlist_type",
-        "vod",
-        "-hls_flags",
-        "independent_segments",
-        "-hls_segment_filename",
-        localSegPattern,
-
+        "-loglevel", "error",
+        "-filter_complex", filter,
+        "-map", "[vout]",
+        "-map", "[aout]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-f", "hls",
+        "-hls_time", "4",
+        "-hls_playlist_type", "vod",
+        "-hls_flags", "independent_segments",
+        "-hls_segment_filename", localSegPattern,
         localMaster
       );
 
