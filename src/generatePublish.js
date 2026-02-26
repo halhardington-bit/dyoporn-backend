@@ -19,7 +19,6 @@ import { s3 } from "./aws/s3Client.js";
 process.on("unhandledRejection", (err) => {
   console.error("🔥 UNHANDLED REJECTION:", err?.stack || err);
 });
-
 process.on("uncaughtException", (err) => {
   console.error("🔥 UNCAUGHT EXCEPTION:", err?.stack || err);
 });
@@ -42,7 +41,7 @@ function runCmd(cmd, args, { cwd } = {}) {
     p.stderr.on("data", (d) => (err += d.toString()));
 
     p.on("error", (e) => {
-      console.error(`❌ Spawn error for ${cmd}:`, e);
+      console.error(`❌ Spawn error for ${cmd}:`, e?.stack || e);
       reject(e);
     });
 
@@ -53,9 +52,10 @@ function runCmd(cmd, args, { cwd } = {}) {
       if (code === 0) return resolve({ out, err, ms });
 
       console.error(`❌ ${cmd} FAILED`);
-      console.error("stderr (first 2000 chars):");
-      console.error(String(err || "").slice(0, 2000));
-      reject(new Error(err || `${cmd} exited with code ${code}`));
+      const tail = String(err || "");
+      console.error("stderr (last 4000 chars):");
+      console.error(tail.slice(Math.max(0, tail.length - 4000)));
+      reject(new Error(tail || `${cmd} exited with code ${code}`));
     });
   });
 }
@@ -99,13 +99,18 @@ function normClips(raw, { kindDefault = null } = {}) {
 }
 
 function splitTimeline(timeline) {
+  // Default kind is "video" if kind missing.
   const all = normClips(timeline, { kindDefault: "video" });
+
+  // Video lane is treated as a single lane (track forced to 0)
   const videoClips = all
     .filter((c) => (c.kind || "video") === "video")
-    .map((c) => ({ ...c, kind: "video", track: 0 })); // video lane = single
+    .map((c) => ({ ...c, kind: "video", track: 0 }));
+
   const audioClips = all
     .filter((c) => c.kind === "audio")
     .map((c) => ({ ...c, kind: "audio" }));
+
   return { all, videoClips, audioClips };
 }
 
@@ -177,7 +182,11 @@ async function downloadS3PrefixToDir({ bucket, prefix, outDir }) {
 
   while (true) {
     const listed = await s3.send(
-      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken })
+      new ListObjectsV2Command({
+        Bucket: bucket,
+        Prefix: prefix,
+        ContinuationToken,
+      })
     );
 
     const items = listed?.Contents || [];
@@ -227,7 +236,10 @@ async function uploadDirToS3({ uploadFileToS3, bucket, localDir, keyPrefix }) {
   console.log("⬆️ Upload dir to S3:", { bucket, localDir, keyPrefix });
   const files = listFilesRecursive(localDir);
   for (const filePath of files) {
-    const rel = path.relative(localDir, filePath).split(path.sep).join("/");
+    const rel = path
+      .relative(localDir, filePath)
+      .split(path.sep)
+      .join("/");
     const key = `${keyPrefix.replace(/\/+$/g, "")}/${rel}`;
     const ext = path.extname(filePath);
     await uploadFileToS3({
@@ -260,7 +272,13 @@ function makeAssetsS3Client() {
   });
 }
 
-async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
+async function uploadFileToAssetsBucket({
+  assetsS3,
+  bucket,
+  key,
+  filePath,
+  contentType,
+}) {
   console.log("⬆️ Upload thumb to assets bucket:", { bucket, key, filePath });
   const Body = fs.createReadStream(filePath);
   await assetsS3.send(
@@ -294,7 +312,9 @@ function buildFilterVideoAndAudio({
     if (idx == null) throw new Error(`Missing input index for videoId ${c.videoId}`);
 
     const dur = Math.max(0, Number(c.out) - Number(c.in));
-    parts.push(`[${idx}:v]trim=start=${c.in}:duration=${dur},setpts=PTS-STARTPTS[v${j}]`);
+    parts.push(
+      `[${idx}:v]trim=start=${c.in}:duration=${dur},setpts=PTS-STARTPTS[v${j}]`
+    );
     vLabels.push(`[v${j}]`);
   }
   parts.push(`${vLabels.join("")}concat=n=${videoClips.length}:v=1:a=0[vout]`);
@@ -303,7 +323,9 @@ function buildFilterVideoAndAudio({
   const safeTotal = Math.max(0.01, Number(totalDur) || 0);
 
   if (!audioClips.length) {
-    parts.push(`anullsrc=r=48000:cl=stereo,atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`);
+    parts.push(
+      `anullsrc=r=48000:cl=stereo,atrim=0:${safeTotal},asetpts=PTS-STARTPTS[aout]`
+    );
     return parts.join(";");
   }
 
@@ -323,7 +345,7 @@ function buildFilterVideoAndAudio({
           `volume=${gain},adelay=${delayMs}|${delayMs}[a${k}]`
       );
     } else {
-      // if the input has no audio stream, feed silence of the same duration
+      // If the input has no audio stream, feed silence of the same duration.
       parts.push(`aevalsrc=0:d=${dur},adelay=${delayMs}|${delayMs}[a${k}]`);
     }
     aLabels.push(`[a${k}]`);
@@ -339,6 +361,9 @@ function buildFilterVideoAndAudio({
 
 /* ============================================================
    STEP SELECTOR
+   Semantics: "run up to step N, then return debug payload".
+   - step can come from query (?step=5), header (x-debug-step), or env (GENERATE_PUBLISH_STEP)
+   - Default runs through all steps (9)
 ============================================================ */
 function getDebugStep(req) {
   const qp = Number(req.query?.step);
@@ -350,12 +375,11 @@ function getDebugStep(req) {
   const env = Number(process.env.GENERATE_PUBLISH_STEP);
   if (Number.isFinite(env)) return env;
 
-  return 4; // default = run everything
+  return 9;
 }
 
-function stepShouldRun(currentStep, requestedStep) {
-  // requestedStep is "run up to this step"
-  return currentStep <= requestedStep;
+function shouldStopAfter(stepJustFinished, requestedStep) {
+  return Number.isFinite(requestedStep) && requestedStep === stepJustFinished;
 }
 
 /* ============================================================
@@ -400,7 +424,7 @@ export function registerGeneratePublish(app, deps = {}) {
       }
     };
 
-    // Keep a debug payload you can return at any step
+    // Debug payload you can return at any step
     const debug = {
       requestedStep,
       ms: {},
@@ -437,6 +461,11 @@ export function registerGeneratePublish(app, deps = {}) {
       }
 
       const { all, videoClips, audioClips } = splitTimeline(timeline);
+      if (!videoClips.length) {
+        cleanup();
+        return res.status(400).json({ error: "Video lane is empty" });
+      }
+
       const totalDur = timelineDurationSeconds(videoClips);
 
       debug.sources.clipCounts = {
@@ -446,14 +475,12 @@ export function registerGeneratePublish(app, deps = {}) {
       };
       debug.sources.totalDur = totalDur;
 
-      console.log("✅ STEP 0 ok");
-      console.log("📊 Clips:", debug.sources.clipCounts);
-      console.log("🕒 Total seconds:", totalDur);
-
       await runCmd("ffmpeg", ["-version"]);
       debug.ms.step0 = Date.now() - t0;
 
-      if (!stepShouldRun(0, requestedStep)) {
+      console.log("✅ STEP 0 ok", debug.sources);
+
+      if (shouldStopAfter(0, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 0, debug });
       }
@@ -471,10 +498,10 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.buckets.uploadsBucket = uploadsBucket;
       debug.buckets.assetsBucket = assetsBucket;
 
-      console.log("✅ STEP 1 ok (buckets present)", debug.buckets);
       debug.ms.step1 = Date.now() - t1;
+      console.log("✅ STEP 1 ok (buckets present)", debug.buckets);
 
-      if (!stepShouldRun(1, requestedStep)) {
+      if (shouldStopAfter(1, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 1, debug });
       }
@@ -483,7 +510,9 @@ export function registerGeneratePublish(app, deps = {}) {
          STEP 2: fetch DB filenames for all referenced sources
       ============================================================ */
       const t2 = Date.now();
-      const sourceIds = Array.from(new Set([...videoClips, ...audioClips].map((c) => String(c.videoId))));
+      const sourceIds = Array.from(
+        new Set([...videoClips, ...audioClips].map((c) => String(c.videoId)))
+      );
       debug.sources.uniqueIds = sourceIds.length;
 
       const q = await pool.query(
@@ -499,10 +528,10 @@ export function registerGeneratePublish(app, deps = {}) {
         if (!key) throw new Error(`Unknown/missing source for videoId ${id}`);
       }
 
-      console.log("✅ STEP 2 ok (DB sources fetched)", { dbRowCount: q.rowCount });
       debug.ms.step2 = Date.now() - t2;
+      console.log("✅ STEP 2 ok (DB sources fetched)", { dbRowCount: q.rowCount });
 
-      if (!stepShouldRun(2, requestedStep)) {
+      if (shouldStopAfter(2, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 2, debug });
       }
@@ -549,14 +578,13 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.sources.downloadedInputs = inputPaths.length;
       debug.sources.audioPresent = Object.fromEntries([...audioPresentByInputIndex.entries()]);
 
+      debug.ms.step3 = Date.now() - t3;
       console.log("✅ STEP 3 ok (downloaded inputs)", {
         inputs: inputPaths.length,
         audioPresent: debug.sources.audioPresent,
       });
 
-      debug.ms.step3 = Date.now() - t3;
-
-      if (!stepShouldRun(3, requestedStep)) {
+      if (shouldStopAfter(3, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 3, debug });
       }
@@ -574,12 +602,12 @@ export function registerGeneratePublish(app, deps = {}) {
         totalDur,
       });
 
-      debug.artifacts.filterPreview = String(filter).slice(0, 500);
-
-      console.log("✅ STEP 4 ok (filter built)");
+      debug.artifacts.filterPreview = String(filter).slice(0, 1000);
       debug.ms.step4 = Date.now() - t4;
 
-      if (!stepShouldRun(4, requestedStep)) {
+      console.log("✅ STEP 4 ok (filter built)");
+
+      if (shouldStopAfter(4, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 4, debug });
       }
@@ -632,10 +660,10 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.artifacts.mp4Path = mp4Path;
       debug.artifacts.mp4Size = fs.statSync(mp4Path).size;
 
-      console.log("✅ STEP 5 ok (mp4 rendered)", { size: debug.artifacts.mp4Size });
       debug.ms.step5 = Date.now() - t5;
+      console.log("✅ STEP 5 ok (mp4 rendered)", { size: debug.artifacts.mp4Size });
 
-      if (!stepShouldRun(5, requestedStep)) {
+      if (shouldStopAfter(5, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 5, debug });
       }
@@ -689,10 +717,10 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.artifacts.hlsLocalDir = hlsLocalDir;
       debug.artifacts.hlsBase = hlsBase;
 
-      console.log("✅ STEP 6 ok (hls created)", { hlsLocalDir });
       debug.ms.step6 = Date.now() - t6;
+      console.log("✅ STEP 6 ok (hls created)", { hlsLocalDir });
 
-      if (!stepShouldRun(6, requestedStep)) {
+      if (shouldStopAfter(6, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 6, debug });
       }
@@ -721,10 +749,10 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.artifacts.thumbPath = thumbPath;
       debug.artifacts.thumbSize = fs.statSync(thumbPath).size;
 
-      console.log("✅ STEP 7 ok (thumb extracted)", { size: debug.artifacts.thumbSize });
       debug.ms.step7 = Date.now() - t7;
+      console.log("✅ STEP 7 ok (thumb extracted)", { size: debug.artifacts.thumbSize });
 
-      if (!stepShouldRun(7, requestedStep)) {
+      if (shouldStopAfter(7, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 7, debug });
       }
@@ -755,14 +783,10 @@ export function registerGeneratePublish(app, deps = {}) {
       debug.artifacts.hlsKeyPrefix = hlsKeyPrefix;
       debug.artifacts.thumbKey = thumbKey;
 
-      console.log("✅ STEP 8 ok (uploads complete)", {
-        hlsKeyPrefix,
-        thumbKey,
-      });
-
       debug.ms.step8 = Date.now() - t8;
+      console.log("✅ STEP 8 ok (uploads complete)", { hlsKeyPrefix, thumbKey });
 
-      if (!stepShouldRun(8, requestedStep)) {
+      if (shouldStopAfter(8, requestedStep)) {
         cleanup();
         return res.json({ ok: true, step: 8, debug });
       }
@@ -813,8 +837,8 @@ export function registerGeneratePublish(app, deps = {}) {
       const newVideoId = ins.rows[0].id;
       debug.artifacts.newVideoId = newVideoId;
 
-      console.log("✅ STEP 9 ok (DB inserted)", { newVideoId });
       debug.ms.step9 = Date.now() - t9;
+      console.log("✅ STEP 9 ok (DB inserted)", { newVideoId });
 
       console.log(`🎉 Publish completed in ${Date.now() - requestStart}ms`);
       cleanup();
@@ -824,7 +848,6 @@ export function registerGeneratePublish(app, deps = {}) {
       console.error("💥 PUBLISH ERROR:");
       console.error(e?.stack || e);
 
-      // best-effort: never throw inside cleanup
       cleanup();
 
       return res.status(500).json({
