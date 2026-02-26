@@ -683,6 +683,7 @@ export function registerGeneratePublish(app, deps = {}) {
       ============================================================ */
       const t6 = Date.now();
 
+      // STEP 5/6 REPLACEMENT: render HLS directly (skip MP4)
       const hlsBase = `gen-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
       const hlsLocalDir = path.join(outDir, `hls-${hlsBase}`);
       fs.mkdirSync(hlsLocalDir, { recursive: true });
@@ -690,14 +691,21 @@ export function registerGeneratePublish(app, deps = {}) {
       const localMaster = path.join(hlsLocalDir, "master.m3u8");
       const localSegPattern = path.join(hlsLocalDir, "seg-%05d.ts");
 
-      await runCmd("ffmpeg", [
+      // Build args: inputs + filtergraph + map + HLS output
+      const hlsArgs = [];
+      for (const p of inputPaths) hlsArgs.push("-i", p);
+
+      hlsArgs.push(
         "-y",
         "-hide_banner",
         "-loglevel",
         "error",
-        "-i",
-        "-threads", "1",
-        mp4Path,
+        "-filter_complex",
+        filter,
+        "-map",
+        "[vout]",
+        "-map",
+        "[aout]",
         "-c:v",
         "libx264",
         "-preset",
@@ -710,16 +718,23 @@ export function registerGeneratePublish(app, deps = {}) {
         "aac",
         "-b:a",
         "192k",
+
+        // HLS options
         "-f",
         "hls",
         "-hls_time",
         "4",
         "-hls_playlist_type",
         "vod",
+        "-hls_flags",
+        "independent_segments",
         "-hls_segment_filename",
         localSegPattern,
-        localMaster,
-      ]);
+
+        localMaster
+      );
+
+      await runCmd("ffmpeg", hlsArgs);
 
       if (!fs.existsSync(localMaster)) {
         throw new Error("HLS export failed: master.m3u8 was not created");
@@ -741,17 +756,31 @@ export function registerGeneratePublish(app, deps = {}) {
       ============================================================ */
       const t7 = Date.now();
 
+      // STEP 7: extract thumbnail from the generated HLS (separate ffmpeg run)
       const safeTotal = Math.max(0.01, Number(totalDur) || 0);
       const mid = clamp(safeTotal / 2, 0, Math.max(0, safeTotal - 0.1));
 
       const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
       const thumbPath = path.join(outDir, thumbName);
 
-      await extractThumbnail({
-        inputPath: mp4Path,
-        outPath: thumbPath,
-        atSeconds: mid,
-      });
+      // IMPORTANT: this uses -vf, but that's fine because THIS run has no -filter_complex
+      await runCmd("ffmpeg", [
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        String(mid),
+        "-i",
+        localMaster,
+        "-frames:v",
+        "1",
+        "-vf",
+        "scale=1280:-2",
+        "-q:v",
+        "2",
+        thumbPath,
+      ]);
 
       if (!fs.existsSync(thumbPath) || fs.statSync(thumbPath).size < 1000) {
         throw new Error("Thumbnail extraction failed (thumb missing or too small)");
