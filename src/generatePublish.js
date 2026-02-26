@@ -350,7 +350,7 @@ function getDebugStep(req) {
   const env = Number(process.env.GENERATE_PUBLISH_STEP);
   if (Number.isFinite(env)) return env;
 
-  return 3; // default = run everything
+  return 4; // default = run everything
 }
 
 function stepShouldRun(currentStep, requestedStep) {
