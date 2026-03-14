@@ -1279,6 +1279,51 @@ app.post("/api/videos/:id/rate", requireAuth, async (req, res) => {
   }
 });
 
+app.post("/api/beta-signup", async (req, res) => {
+  try {
+    const email = String(req.body?.email || "").trim().toLowerCase();
+
+    if (!email) {
+      return res.status(400).json({ error: "Email is required" });
+    }
+
+    const emailOk = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+    if (!emailOk) {
+      return res.status(400).json({ error: "Please enter a valid email address" });
+    }
+
+    const existing = await pool.query(
+      `SELECT id FROM beta_signups WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+
+    if (existing.rows.length) {
+      return res.json({
+        ok: true,
+        alreadySignedUp: true,
+        message: "You're already on the waitlist.",
+      });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO beta_signups (email, source)
+      VALUES ($1, $2)
+      `,
+      [email, "landing_page"]
+    );
+
+    return res.json({
+      ok: true,
+      alreadySignedUp: false,
+      message: "Thanks! You've joined the beta waitlist.",
+    });
+  } catch (e) {
+    console.error("POST /api/beta-signup error:", e);
+    return res.status(500).json({ error: "Failed to join waitlist" });
+  }
+});
+
 // -------------------------
 // Videos API
 // -------------------------
