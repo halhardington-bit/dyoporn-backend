@@ -15,6 +15,7 @@ import multer from "multer";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import os from "os";
+import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { registerGeneratePublish } from "./generatePublish.js";
 import { registerGenerateProjects } from "./generateProjects.js";
@@ -54,6 +55,39 @@ const allowedOrigins = new Set(
     .map((s) => s.trim().replace(/\/$/, "")) // ✅ remove trailing slash
     .filter(Boolean)
 );
+
+
+function makeAssetsS3Client() {
+  const region =
+    process.env.S3_ASSETS_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_DEFAULT_REGION;
+
+  if (!region) {
+    throw new Error("Missing env S3_ASSETS_REGION (or AWS_REGION) for assets bucket uploads");
+  }
+
+  const endpoint = process.env.S3_ASSETS_ENDPOINT || undefined;
+
+  return new S3Client({
+    region,
+    ...(endpoint ? { endpoint } : {}),
+  });
+}
+
+async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
+  const Body = fs.createReadStream(filePath);
+
+  await assetsS3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body,
+      ContentType: contentType,
+      CacheControl: "public, max-age=31536000, immutable",
+    })
+  );
+}
 
 
 function expandOrigin(s) {
@@ -287,6 +321,12 @@ function runCmd(cmd, args) {
 async function generateHls(inputPath, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
 
+  // Important: normalize to forward slashes for ffmpeg/HLS manifests
+  const outDirPosix = outDir.replace(/\\/g, "/");
+
+  const segPattern = `${outDirPosix}/v%v/seg_%05d.ts`;
+  const playlistPattern = `${outDirPosix}/v%v/playlist.m3u8`;
+
   const vf0 =
     "scale=854:480:force_original_aspect_ratio=decrease," +
     "pad=854:480:(854-iw)/2:(480-ih)/2," +
@@ -339,10 +379,10 @@ async function generateHls(inputPath, outDir) {
     "-hls_playlist_type", "vod",
     "-hls_flags", "independent_segments",
     "-hls_segment_type", "mpegts",
-    "-hls_segment_filename", path.join(outDir, "v%v", "seg_%05d.ts"),
+    "-hls_segment_filename", segPattern,
     "-master_pl_name", "master.m3u8",
     "-var_stream_map", "v:0,a:0 v:1,a:1",
-    path.join(outDir, "v%v", "playlist.m3u8"),
+    playlistPattern,
   ];
 
   await runCmd("ffmpeg", args);
@@ -1282,6 +1322,8 @@ app.post("/api/videos/:id/rate", requireAuth, async (req, res) => {
 app.post("/api/beta-signup", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
+    const watching = !!req.body?.watching;
+    const creating = !!req.body?.creating;
 
     if (!email) {
       return res.status(400).json({ error: "Email is required" });
@@ -1293,7 +1335,7 @@ app.post("/api/beta-signup", async (req, res) => {
     }
 
     const existing = await pool.query(
-      `SELECT id FROM beta_signups WHERE email = $1 LIMIT 1`,
+      `SELECT id FROM beta_waitlist WHERE email = $1 LIMIT 1`,
       [email]
     );
 
@@ -1307,10 +1349,10 @@ app.post("/api/beta-signup", async (req, res) => {
 
     await pool.query(
       `
-      INSERT INTO beta_signups (email, source)
-      VALUES ($1, $2)
+      INSERT INTO beta_waitlist (email, watching, creating)
+      VALUES ($1, $2, $3)
       `,
-      [email, "landing_page"]
+      [email, watching, creating]
     );
 
     return res.json({
@@ -1624,27 +1666,39 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     storedFilename = audioKey;
   }
 
-  // Upload thumb to S3 (only if we generated one)
-  if (
-    storedThumb !== "placeholder.jpg" &&
-    process.env.S3_ASSETS_BUCKET
-  ) {
+   // Upload thumb to assets bucket (only if we generated one)
+  if (storedThumb !== "placeholder.jpg") {
+    const assetsBucket = process.env.S3_ASSETS_BUCKET;
+    if (!assetsBucket) {
+      throw new Error("Missing env S3_ASSETS_BUCKET while uploading thumbnail");
+    }
+
     const thumbPath = path.join(THUMB_DIR, storedThumb);
     if (fs.existsSync(thumbPath)) {
-      log("S3 thumb upload start", { bucket: process.env.S3_ASSETS_BUCKET, key: storedThumb });
-      try {
-        await uploadFileToS3({
-          bucket: process.env.S3_ASSETS_BUCKET,
-          key: storedThumb,
-          filePath: thumbPath,
-          contentType: "image/jpeg",
-        });
-        log("S3 thumb upload ok");
-      } catch (e) {
-        log("S3 thumb upload failed", { error: e?.message });
-      }
+      const assetsS3 = makeAssetsS3Client();
+      const thumbKey = `thumbs/${userId}/${storedThumb}`;
 
-      try { fs.unlinkSync(thumbPath); } catch {}
+      log("S3 thumb upload start", {
+        bucket: assetsBucket,
+        key: thumbKey,
+      });
+
+      await uploadFileToAssetsBucket({
+        assetsS3,
+        bucket: assetsBucket,
+        key: thumbKey,
+        filePath: thumbPath,
+        contentType: "image/jpeg",
+      });
+
+      storedThumb = thumbKey;
+      log("S3 thumb upload ok", { key: storedThumb });
+
+      try {
+        fs.unlinkSync(thumbPath);
+      } catch {}
+    } else {
+      throw new Error(`Generated thumbnail missing at expected path: ${thumbPath}`);
     }
   }
 

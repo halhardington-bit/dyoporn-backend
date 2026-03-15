@@ -54,7 +54,7 @@ export async function uploadDirToS3({ bucket, dirPath, keyPrefix }) {
         Body: fs.createReadStream(filePath),
         ContentType: contentTypeForKey(key),
         CacheControl: isPlaylist
-          ? "no-cache"
+          ? "public, max-age=60, must-revalidate"
           : "public, max-age=31536000, immutable",
       })
     );
