@@ -1282,6 +1282,8 @@ app.post("/api/videos/:id/rate", requireAuth, async (req, res) => {
 app.post("/api/beta-signup", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
+    const watching = !!req.body?.watching;
+    const creating = !!req.body?.creating;
 
     if (!email) {
       return res.status(400).json({ error: "Email is required" });
@@ -1293,7 +1295,7 @@ app.post("/api/beta-signup", async (req, res) => {
     }
 
     const existing = await pool.query(
-      `SELECT id FROM beta_signups WHERE email = $1 LIMIT 1`,
+      `SELECT id FROM beta_waitlist WHERE email = $1 LIMIT 1`,
       [email]
     );
 
@@ -1307,10 +1309,10 @@ app.post("/api/beta-signup", async (req, res) => {
 
     await pool.query(
       `
-      INSERT INTO beta_signups (email, source)
-      VALUES ($1, $2)
+      INSERT INTO beta_waitlist (email, watching, creating)
+      VALUES ($1, $2, $3)
       `,
-      [email, "landing_page"]
+      [email, watching, creating]
     );
 
     return res.json({
