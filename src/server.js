@@ -294,6 +294,169 @@ const upload = multer({
   },
 });
 
+
+
+// -------------------------
+// Subscriptions
+// -------------------------
+
+app.post("/api/channels/:channelId/subscribe", requireAuth, async (req, res) => {
+  const subscriberId = Number(req.user.id);
+  const channelId = Number(req.params.channelId);
+
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    return res.status(400).json({ error: "Invalid channel id" });
+  }
+
+  if (subscriberId === channelId) {
+    return res.status(400).json({ error: "You cannot subscribe to yourself" });
+  }
+
+  try {
+    const exists = await pool.query(
+      `SELECT id, username FROM users WHERE id = $1 LIMIT 1`,
+      [channelId]
+    );
+
+    if (!exists.rows[0]) {
+      return res.status(404).json({ error: "Channel not found" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO subscriptions (subscriber_id, channel_id)
+      VALUES ($1, $2)
+      ON CONFLICT DO NOTHING
+      `,
+      [subscriberId, channelId]
+    );
+
+    const countResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM subscriptions
+      WHERE channel_id = $1
+      `,
+      [channelId]
+    );
+
+    return res.json({
+      ok: true,
+      subscribed: true,
+      subscriberCount: countResult.rows[0].count,
+    });
+  } catch (err) {
+    console.error("Subscribe error:", err);
+    return res.status(500).json({ error: "Failed to subscribe" });
+  }
+});
+
+app.delete("/api/channels/:channelId/subscribe", requireAuth, async (req, res) => {
+  const subscriberId = Number(req.user.id);
+  const channelId = Number(req.params.channelId);
+
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    return res.status(400).json({ error: "Invalid channel id" });
+  }
+
+  try {
+    await pool.query(
+      `
+      DELETE FROM subscriptions
+      WHERE subscriber_id = $1 AND channel_id = $2
+      `,
+      [subscriberId, channelId]
+    );
+
+    const countResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM subscriptions
+      WHERE channel_id = $1
+      `,
+      [channelId]
+    );
+
+    return res.json({
+      ok: true,
+      subscribed: false,
+      subscriberCount: countResult.rows[0].count,
+    });
+  } catch (err) {
+    console.error("Unsubscribe error:", err);
+    return res.status(500).json({ error: "Failed to unsubscribe" });
+  }
+});
+
+app.get("/api/channels/:channelId/subscription", async (req, res) => {
+  const channelId = Number(req.params.channelId);
+
+  if (!Number.isInteger(channelId) || channelId <= 0) {
+    return res.status(400).json({ error: "Invalid channel id" });
+  }
+
+  try {
+    const countResult = await pool.query(
+      `
+      SELECT COUNT(*)::int AS count
+      FROM subscriptions
+      WHERE channel_id = $1
+      `,
+      [channelId]
+    );
+
+    let subscribed = false;
+
+    if (req.user?.id) {
+      const subResult = await pool.query(
+        `
+        SELECT 1
+        FROM subscriptions
+        WHERE subscriber_id = $1 AND channel_id = $2
+        LIMIT 1
+        `,
+        [req.user.id, channelId]
+      );
+
+      subscribed = subResult.rowCount > 0;
+    }
+
+    return res.json({
+      subscribed,
+      subscriberCount: countResult.rows[0].count,
+    });
+  } catch (err) {
+    console.error("Subscription status error:", err);
+    return res.status(500).json({ error: "Failed to fetch subscription status" });
+  }
+});
+
+app.get("/api/me/subscriptions", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.username AS display_name,
+        NULL AS avatar_url,
+        s.created_at
+      FROM subscriptions s
+      JOIN users u ON u.id = s.channel_id
+      WHERE s.subscriber_id = $1
+      ORDER BY s.created_at DESC
+      `,
+      [req.user.id]
+    );
+
+    return res.json(result.rows);
+  } catch (err) {
+    console.error("My subscriptions error:", err);
+    return res.status(500).json({ error: "Failed to fetch subscriptions" });
+  }
+});
+
+
 // -------------------------
 // FFMPEG helpers
 // -------------------------
@@ -1366,6 +1529,76 @@ app.post("/api/beta-signup", async (req, res) => {
   }
 });
 
+
+app.post("/api/videos/:id/history", requireAuth, async (req, res) => {
+  const videoId = String(req.params.id);
+  const userId = Number(req.user.id);
+  const progressSeconds = Number(req.body?.progressSeconds || 0);
+
+  try {
+    const exists = await pool.query(
+      `SELECT id FROM videos WHERE id::text = $1::text LIMIT 1`,
+      [videoId]
+    );
+
+    if (!exists.rows.length) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO watch_history (user_id, video_id, watched_at, progress_seconds)
+      VALUES ($1, $2, NOW(), $3)
+      ON CONFLICT (user_id, video_id)
+      DO UPDATE SET
+        watched_at = NOW(),
+        progress_seconds = EXCLUDED.progress_seconds
+      `,
+      [userId, videoId, Math.max(0, progressSeconds)]
+    );
+
+    return res.json({ ok: true, videoId });
+  } catch (e) {
+    console.error("POST /api/videos/:id/history error:", e);
+    return res.status(500).json({ error: "Failed to record history" });
+  }
+});
+
+
+app.delete("/api/me/history/:videoId", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+  const videoId = String(req.params.videoId);
+
+  try {
+    await pool.query(
+      `
+      DELETE FROM watch_history
+      WHERE user_id = $1 AND video_id = $2
+      `,
+      [userId, videoId]
+    );
+
+    return res.json({ ok: true, videoId });
+  } catch (e) {
+    console.error("DELETE /api/me/history/:videoId error:", e);
+    return res.status(500).json({ error: "Failed to remove history item" });
+  }
+});
+
+
+app.delete("/api/me/history", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+
+  try {
+    await pool.query(`DELETE FROM watch_history WHERE user_id = $1`, [userId]);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("DELETE /api/me/history error:", e);
+    return res.status(500).json({ error: "Failed to clear history" });
+  }
+});
+
+
 // -------------------------
 // Videos API
 // -------------------------
@@ -1374,21 +1607,143 @@ app.get("/api/videos", async (req, res) => {
     const q = String(req.query.q || "").trim();
     const category = String(req.query.category || "").trim();
     const sort = String(req.query.sort || "newest").toLowerCase().trim();
+    const filter = String(req.query.filter || "").toLowerCase().trim();
 
-    // ORDER BY whitelist (prevents SQL injection)
+    const requesterId = req.user?.id ? Number(req.user.id) : null;
+
+        // -------------------------
+    // Watch History mode
+    // -------------------------
+    if (filter === "history") {
+      if (!requesterId) {
+        return res.status(401).json({ error: "Not logged in" });
+      }
+
+      const historyResult = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name,
+          wh.watched_at,
+          wh.progress_seconds
+        FROM watch_history wh
+        JOIN videos v ON v.id::text = wh.video_id::text
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE wh.user_id = $1
+          AND v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY wh.watched_at DESC
+        LIMIT 200
+        `,
+        [requesterId]
+      );
+
+      const enriched = await Promise.all(
+        historyResult.rows.map(async (v) => {
+          const apiVideo = await toApiVideo(req, v);
+          return {
+            ...apiVideo,
+            watchedAt: v.watched_at || null,
+            progressSeconds: Number(v.progress_seconds || 0),
+          };
+        })
+      );
+
+      return res.json(enriched);
+    }
+
+    // -------------------------
+    // Recently Rated mode
+    // -------------------------
+    if (filter === "rated") {
+      if (!requesterId) {
+        return res.status(401).json({ error: "Not logged in" });
+      }
+
+      const ratedResult = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name,
+          vr.rating AS my_rating,
+          vr.updated_at AS rated_at
+        FROM video_ratings vr
+        JOIN videos v ON v.id::text = vr.video_id::text
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE vr.user_id = $1
+          AND v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY vr.updated_at DESC
+        LIMIT 200
+        `,
+        [requesterId]
+      );
+
+      const enriched = await Promise.all(
+        ratedResult.rows.map(async (v) => {
+          const apiVideo = await toApiVideo(req, v);
+          return {
+            ...apiVideo,
+            myRating: Number(v.my_rating || 0),
+            ratedAt: v.rated_at || null,
+          };
+        })
+      );
+
+      return res.json(enriched);
+    }
+
+    // -------------------------
+    // Normal browse / search mode
+    // -------------------------
     let orderBy = "v.created_at DESC";
     if (sort === "oldest") orderBy = "v.created_at ASC";
     else if (sort === "views") orderBy = "v.views DESC NULLS LAST, v.created_at DESC";
-    else if (sort === "highest")
+    else if (sort === "highest") {
       orderBy =
         "COALESCE(vrs.rating_avg, 0) DESC, COALESCE(vrs.rating_count, 0) DESC, v.created_at DESC";
+    }
 
-    // Build WHERE dynamically but safely
     const where = [
       `v.visibility = 'public'`,
       `v.asset_scope = 'public'`,
       `v.media_type = 'video'`,
     ];
+
     const params = [];
     let i = 1;
 
@@ -1398,7 +1753,6 @@ app.get("/api/videos", async (req, res) => {
     }
 
     if (q) {
-      // split words, match ALL tokens somewhere
       const tokens = q.split(/\s+/).filter(Boolean).slice(0, 10);
       for (const t of tokens) {
         where.push(`
@@ -1429,6 +1783,8 @@ app.get("/api/videos", async (req, res) => {
         v.description,
         v.category,
         v.visibility,
+        v.media_type,
+        v.asset_scope,
         v.filename,
         v.thumb,
         v.duration_text,
