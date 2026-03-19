@@ -55,125 +55,218 @@ function buildEmailTemplate({
   const safeActionUrl = escapeHtml(actionUrl);
 
   return `
-    <div style="margin:0; padding:0; background:#e7e7e7;">
-      <div style="
-        margin:0;
-        padding:42px 20px;
-        background:#e7e7e7;
-        font-family:Arial, Helvetica, sans-serif;
-      ">
-        <div style="max-width:620px; margin:0 auto;">
-
-          <!-- CARD -->
-          <div style="
-            background:#171717;
-            border:1px solid #2a2a2a;
-            border-radius:18px;
-            padding:40px 28px 34px;
-            text-align:center;
-            box-shadow:0 12px 34px rgba(0,0,0,0.18);
-            max-width:500px;
-            margin:0 auto;
-          ">
-
-            <!-- LOGO INSIDE -->
-            <div style="
-              font-size:20px;
-              font-weight:800;
-              letter-spacing:0.05em;
-              color:#ffffff;
-              margin-bottom:18px;
-            ">
-              ${safeEyebrow}
-            </div>
-
-            <h1 style="
-              margin:0 0 12px;
-              font-size:24px;
-              line-height:1.2;
-              color:#ffffff;
-              font-weight:800;
-            ">
-              ${safeTitle}
-            </h1>
-
-            <p style="
-              margin:0 0 24px;
-              font-size:15px;
-              line-height:1.6;
-              color:rgba(255,255,255,0.78);
-            ">
-              ${safeIntro}
-            </p>
-
-            <a
-              href="${safeActionUrl}"
-              style="
-                display:inline-block;
-                padding:13px 22px;
-                border-radius:12px;
-                background:linear-gradient(180deg, #3a3a3a, #2e2e2e);
-                border:1px solid #5a5a5a;
-                color:#ffffff;
-                text-decoration:none;
-                font-size:15px;
-                font-weight:700;
-              "
-            >
-              ${safeActionLabel}
-            </a>
-
-            <div style="
-              margin-top:24px;
-              padding-top:18px;
-              border-top:1px solid rgba(255,255,255,0.08);
-            ">
-              <p style="
-                margin:0 0 8px;
-                font-size:12px;
-                line-height:1.5;
-                color:rgba(255,255,255,0.42);
-              ">
-                If the button doesn’t work, use this link:
-              </p>
-
-              <p style="
-                margin:0;
-                font-size:12px;
-                line-height:1.6;
-                color:rgba(255,255,255,0.52);
-                word-break:break-word;
-              ">
-                <a href="${safeActionUrl}" style="color:#9fb0c8; text-decoration:underline;">
-                  ${safeActionUrl}
-                </a>
-              </p>
-            </div>
-
-            <p style="
-              margin:18px 0 0;
-              font-size:12px;
-              line-height:1.6;
-              color:rgba(255,255,255,0.56);
-            ">
-              ${safeHoursText}
-            </p>
-          </div>
-
-          <p style="
-            margin:18px auto 0;
-            max-width:500px;
-            text-align:center;
-            font-size:12px;
-            line-height:1.6;
-            color:#5c5c5c;
-          ">
-            ${safeFooter}
-          </p>
-
-        </div>
-      </div>
+<!doctype html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="supported-color-schemes" content="light dark" />
+    <title>${safeTitle}</title>
+  </head>
+  <body
+    style="margin:0; padding:0; background-color:#0f0f10; color:#ffffff;"
+    bgcolor="#0f0f10"
+  >
+    <div style="display:none; max-height:0; overflow:hidden; opacity:0; mso-hide:all;">
+      ${safeTitle}
     </div>
+
+    <table
+      role="presentation"
+      cellpadding="0"
+      cellspacing="0"
+      border="0"
+      width="100%"
+      style="width:100%; border-collapse:collapse; background-color:#0f0f10; margin:0; padding:0;"
+      bgcolor="#0f0f10"
+    >
+      <tr>
+        <td align="center" style="padding:32px 16px;" bgcolor="#0f0f10">
+
+          <table
+            role="presentation"
+            cellpadding="0"
+            cellspacing="0"
+            border="0"
+            width="100%"
+            style="max-width:620px; width:100%; border-collapse:collapse;"
+          >
+            <tr>
+              <td align="center">
+
+                <table
+                  role="presentation"
+                  cellpadding="0"
+                  cellspacing="0"
+                  border="0"
+                  width="100%"
+                  style="
+                    max-width:500px;
+                    width:100%;
+                    border-collapse:separate;
+                    background-color:#171717;
+                    border:1px solid #2a2a2a;
+                    border-radius:18px;
+                  "
+                  bgcolor="#171717"
+                >
+                  <tr>
+                    <td
+                      align="center"
+                      style="
+                        padding:40px 28px 34px;
+                        font-family:Arial, Helvetica, sans-serif;
+                        color:#ffffff;
+                        text-align:center;
+                      "
+                    >
+                      <div
+                        style="
+                          font-size:20px;
+                          line-height:1.2;
+                          font-weight:800;
+                          letter-spacing:0.05em;
+                          color:#ffffff;
+                          margin:0 0 18px;
+                        "
+                      >
+                        ${safeEyebrow}
+                      </div>
+
+                      <h1
+                        style="
+                          margin:0 0 12px;
+                          font-size:24px;
+                          line-height:1.2;
+                          font-weight:800;
+                          color:#ffffff;
+                        "
+                      >
+                        ${safeTitle}
+                      </h1>
+
+                      <p
+                        style="
+                          margin:0 0 24px;
+                          font-size:15px;
+                          line-height:1.6;
+                          color:#cfcfcf;
+                        "
+                      >
+                        ${safeIntro}
+                      </p>
+
+                      <table
+                        role="presentation"
+                        cellpadding="0"
+                        cellspacing="0"
+                        border="0"
+                        style="margin:0 auto;"
+                      >
+                        <tr>
+                          <td
+                            align="center"
+                            bgcolor="#2f2f2f"
+                            style="
+                              border:1px solid #5a5a5a;
+                              border-radius:12px;
+                            "
+                          >
+                            <a
+                              href="${safeActionUrl}"
+                              style="
+                                display:inline-block;
+                                padding:13px 22px;
+                                font-family:Arial, Helvetica, sans-serif;
+                                font-size:15px;
+                                line-height:1.2;
+                                font-weight:700;
+                                color:#ffffff;
+                                text-decoration:none;
+                                background-color:#2f2f2f;
+                                border-radius:12px;
+                              "
+                            >
+                              ${safeActionLabel}
+                            </a>
+                          </td>
+                        </tr>
+                      </table>
+
+                      <div
+                        style="
+                          margin-top:24px;
+                          padding-top:18px;
+                          border-top:1px solid #2a2a2a;
+                        "
+                      >
+                        <p
+                          style="
+                            margin:0 0 8px;
+                            font-size:12px;
+                            line-height:1.5;
+                            color:#9a9a9a;
+                          "
+                        >
+                          If the button doesn’t work, use this link:
+                        </p>
+
+                        <p
+                          style="
+                            margin:0;
+                            font-size:12px;
+                            line-height:1.6;
+                            color:#b8c7da;
+                            word-break:break-word;
+                          "
+                        >
+                          <a
+                            href="${safeActionUrl}"
+                            style="color:#b8c7da; text-decoration:underline;"
+                          >
+                            ${safeActionUrl}
+                          </a>
+                        </p>
+                      </div>
+
+                      <p
+                        style="
+                          margin:18px 0 0;
+                          font-size:12px;
+                          line-height:1.6;
+                          color:#aaaaaa;
+                        "
+                      >
+                        ${safeHoursText}
+                      </p>
+                    </td>
+                  </tr>
+                </table>
+
+                <p
+                  style="
+                    margin:18px auto 0;
+                    max-width:500px;
+                    font-family:Arial, Helvetica, sans-serif;
+                    font-size:12px;
+                    line-height:1.6;
+                    color:#7a7a7a;
+                    text-align:center;
+                  "
+                >
+                  ${safeFooter}
+                </p>
+
+              </td>
+            </tr>
+          </table>
+
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
   `;
 }
 

@@ -89,6 +89,58 @@ async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, conte
   );
 }
 
+function scoreVideo(v, context) {
+  let score = 0;
+
+  // 🔥 Recency (newer = better)
+  const ageHours =
+    (Date.now() - new Date(v.createdAt).getTime()) / (1000 * 60 * 60);
+  score += Math.max(0, 48 - ageHours); // decay after 48h
+
+  // 👀 Views (popularity)
+  score += Math.log10((v.views || 0) + 1) * 5;
+
+  // ⭐ Rating
+  if (v.ratingAvg) {
+    score += v.ratingAvg * 3;
+  }
+
+  // 🎯 Tag match (personalization)
+  if (context?.preferredTags && v.tags) {
+    const overlap = v.tags.filter((t) =>
+      context.preferredTags.has(t)
+    ).length;
+
+    score += overlap * 10;
+  }
+
+  return score;
+}
+
+async function getUserPreferences(userId) {
+  const result = await pool.query(`
+    SELECT unnest(tags) AS tag
+    FROM videos v
+    JOIN video_ratings vr ON vr.video_id = v.id
+    WHERE vr.user_id = $1 AND vr.rating >= 4
+  `, [userId]);
+
+  const tagCounts = new Map();
+
+  for (const row of result.rows) {
+    const tag = row.tag;
+    tagCounts.set(tag, (tagCounts.get(tag) || 0) + 1);
+  }
+
+  return {
+    preferredTags: new Set(
+      [...tagCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([tag]) => tag)
+    ),
+  };
+}
 
 function expandOrigin(s) {
   const v = String(s || "").trim().replace(/\/$/, "");
@@ -704,44 +756,6 @@ async function getRatingStats(videoId) {
   }
 }
 
-// -------------------------
-// DB fetches
-// -------------------------
-async function fetchVideosFromDb() {
-  const result = await pool.query(
-    `
-    SELECT
-      v.id,
-      v.user_id,
-      v.title,
-      v.description,
-      v.category,
-      WHERE v.visibility = 'public'
-        AND v.asset_scope = 'public'
-        AND v.media_type = 'video'
-      v.filename,
-      v.thumb,
-      v.duration_text,
-      v.views,
-      v.media_type,
-      v.asset_scope,
-      v.filename,
-      v.tags,
-      v.created_at AS "createdAt",
-      v.updated_at AS "updatedAt",
-      u.username AS channel_username,
-      COALESCE(p.display_name, '') AS channel_display_name
-    FROM videos v
-    JOIN users u ON u.id = v.user_id
-    LEFT JOIN user_profiles p ON p.user_id = u.id
-    WHERE v.visibility = 'public'
-    ORDER BY v.created_at DESC
-    LIMIT 200
-    `
-  );
-  return result.rows;
-}
-
 async function fetchVideoById(videoId) {
   const result = await pool.query(
     `
@@ -758,6 +772,7 @@ async function fetchVideoById(videoId) {
       v.filename,
       v.thumb,
       v.duration_text,
+      v.duration,
       v.views,
       v.tags,
       v.asset_scope,
@@ -819,7 +834,12 @@ async function toApiVideo(req, v) {
     createdAt: v.createdAt,
     updatedAt: v.updatedAt,
     views: v.views ?? null,
+
     durationText: v.duration_text || null,
+    durationSeconds: Number(v.duration || 0),
+
+    progressSeconds: Number(v.progress_seconds || 0),
+
     tags: Array.isArray(v.tags) ? v.tags : [],
     mediaType: v.media_type || "video",
     assetScope: v.asset_scope || "public",
@@ -830,6 +850,75 @@ async function toApiVideo(req, v) {
     thumbUrl,
     playbackUrl,
   };
+}
+
+function uniqueById(rows = []) {
+  const seen = new Set();
+  const out = [];
+  for (const row of rows) {
+    const id = String(row?.id ?? "");
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(row);
+  }
+  return out;
+}
+
+async function enrichRows(req, rows) {
+  return Promise.all(rows.map((v) => toApiVideo(req, v)));
+}
+
+function filterOutSeenVideos(rows = [], seenIds = new Set()) {
+  const out = [];
+
+  for (const row of rows) {
+    const id = String(row?.id ?? "");
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    out.push(row);
+  }
+
+  return out;
+}
+
+async function buildHomeRow({
+  req,
+  key,
+  title,
+  dbRows,
+  seenIds,
+  minVideos = 1,
+  allowDuplicates = false,
+  limit = 12,
+  context = null, // 👈 NEW
+}) {
+  const uniqueRows = uniqueById(dbRows);
+
+  let filteredRows = allowDuplicates
+    ? uniqueRows
+    : uniqueRows.filter((row) => !seenIds.has(String(row.id)));
+
+  // 🔥 SCORE + SORT
+  if (context) {
+    filteredRows = filteredRows
+      .map((v) => ({ ...v, __score: scoreVideo(v, context) }))
+      .sort((a, b) => b.__score - a.__score);
+  }
+
+  filteredRows = filteredRows.slice(0, limit);
+
+  if (filteredRows.length < minVideos) return null;
+
+  const videos = await enrichRows(req, filteredRows);
+  if (!videos.length) return null;
+
+  if (!allowDuplicates) {
+    for (const row of filteredRows) {
+      seenIds.add(String(row.id));
+    }
+  }
+
+  return { key, title, videos };
 }
 
 registerGenerateProjects(app, {
@@ -941,6 +1030,372 @@ app.get("/api/profile/u/:username/videos", async (req, res) => {
   } catch (e) {
     console.error("GET /api/profile/u/:username/videos error:", e);
     return res.status(500).json({ error: "Failed to load user videos" });
+  }
+});
+
+app.get("/api/home", async (req, res) => {
+  try {
+    const userId = req.user?.id ? String(req.user.id) : null;
+    const rows = [];
+    const seenIds = new Set();
+
+    let context = null;
+
+    if (userId) {
+      context = await getUserPreferences(userId);
+}
+
+    console.log("[/api/home] start", { userId });
+
+    // -------------------------
+    // Continue Watching
+    // -------------------------
+    if (userId) {
+      const continueRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.duration,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name,
+          wh.watched_at,
+          wh.progress_seconds
+        FROM watch_history wh
+        JOIN videos v ON v.id::text = wh.video_id::text
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE wh.user_id::text = $1::text
+          AND v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY wh.watched_at DESC
+        LIMIT 12
+        `,
+        [userId]
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "continue-watching",
+        title: "Continue Watching",
+        dbRows: continueRows.rows,
+        seenIds,
+        minVideos: 1,
+        context,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // From Your Subscriptions
+    // -------------------------
+    if (userId) {
+      const subscriptionRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM subscriptions s
+        JOIN videos v ON v.user_id::text = s.channel_id::text
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE s.subscriber_id::text = $1::text
+          AND v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY v.created_at DESC
+        LIMIT 16
+        `,
+        [userId]
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "from-subscriptions",
+        title: "From Your Subscriptions",
+        dbRows: subscriptionRows.rows,
+        seenIds,
+        minVideos: 4,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // Because You Rated Similar Videos
+    // -------------------------
+    if (userId) {
+      const ratedTagRows = await pool.query(
+        `
+        WITH liked_videos AS (
+          SELECT v.tags::text[] AS tags
+          FROM video_ratings vr
+          JOIN videos v ON v.id::text = vr.video_id::text
+          WHERE vr.user_id::text = $1::text
+            AND vr.rating >= 4
+            AND v.tags IS NOT NULL
+        ),
+        top_tags AS (
+          SELECT tag, COUNT(*)::int AS score
+          FROM liked_videos,
+               unnest(COALESCE(tags, ARRAY[]::text[])) AS tag
+          GROUP BY tag
+          ORDER BY score DESC, tag ASC
+          LIMIT 5
+        )
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+          AND EXISTS (
+            SELECT 1
+            FROM top_tags tt
+            WHERE tt.tag = ANY(COALESCE(v.tags::text[], ARRAY[]::text[]))
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM watch_history wh
+            WHERE wh.user_id::text = $1::text
+              AND wh.video_id::text = v.id::text
+          )
+        ORDER BY v.views DESC NULLS LAST, v.created_at DESC
+        LIMIT 16
+        `,
+        [userId]
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "based-on-ratings",
+        title: "Because You Rated Similar Videos",
+        dbRows: ratedTagRows.rows,
+        seenIds,
+        minVideos: 4,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // Trending
+    // -------------------------
+    {
+      const trendingRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+          AND v.created_at >= now() - interval '14 days'
+        ORDER BY v.views DESC NULLS LAST, v.created_at DESC
+        LIMIT 16
+        `
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "trending",
+        title: "Trending",
+        dbRows: trendingRows.rows,
+        seenIds,
+        minVideos: 4,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // New Uploads
+    // -------------------------
+    {
+      const newRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY v.created_at DESC
+        LIMIT 40
+        `
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "new-uploads",
+        title: "New Uploads",
+        dbRows: newRows.rows,
+        seenIds,
+        minVideos: 1,
+        allowDuplicates: true,
+        limit: 12,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // Explore Something New
+    // -------------------------
+    {
+      const params = [];
+      let watchedClause = "";
+
+      if (userId) {
+        params.push(userId);
+        watchedClause = `
+          AND NOT EXISTS (
+            SELECT 1
+            FROM watch_history wh
+            WHERE wh.user_id::text = $1::text
+              AND wh.video_id::text = v.id::text
+          )
+        `;
+      }
+
+      const exploreRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+          ${watchedClause}
+        ORDER BY RANDOM()
+        LIMIT 16
+        `,
+        params
+      );
+
+      const row = await buildHomeRow({
+        req,
+        key: "explore",
+        title: "Explore Something New",
+        dbRows: exploreRows.rows,
+        seenIds,
+        minVideos: 4,
+      });
+
+      if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // Final trim
+    // -------------------------
+    const finalRows = rows.slice(0, 6);
+
+    return res.json(finalRows);
+  } catch (e) {
+    console.error("GET /api/home error:", e);
+    return res.status(500).json({ error: e.message || "Failed to load home rows" });
   }
 });
 
@@ -1848,7 +2303,34 @@ app.get("/api/videos/:id", async (req, res) => {
       return res.status(404).json({ error: "Not found" });
     }
 
-    res.json(await toApiVideo(req, v));
+    const apiVideo = await toApiVideo(req, v);
+
+    let progressSeconds = 0;
+    let watchedAt = null;
+
+    if (requesterId != null) {
+      const historyRes = await pool.query(
+        `
+        SELECT progress_seconds, watched_at
+        FROM watch_history
+        WHERE user_id = $1
+          AND video_id::text = $2::text
+        LIMIT 1
+        `,
+        [requesterId, String(v.id)]
+      );
+
+      if (historyRes.rows[0]) {
+        progressSeconds = Number(historyRes.rows[0].progress_seconds || 0);
+        watchedAt = historyRes.rows[0].watched_at || null;
+      }
+    }
+
+    res.json({
+      ...apiVideo,
+      progressSeconds,
+      watchedAt,
+    });
   } catch (e) {
     console.error("GET /api/videos/:id error:", e);
     res.status(500).json({ error: "Failed to load video" });
