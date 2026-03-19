@@ -206,6 +206,7 @@ async function getUserFromSession(req) {
     u.id,
     u.username,
     u.tokens,
+    u.email_verified,
     COALESCE(AVG(vr.rating)::float, 0) AS rating,
     COALESCE(COUNT(vr.rating)::int, 0) AS review_count
   FROM sessions s
@@ -228,6 +229,7 @@ async function getUserFromSession(req) {
     tokens: u.tokens,
     rating: u.rating,
     reviewCount: u.review_count,
+    emailVerified: !!u.email_verified,
   };
 }
 
@@ -300,7 +302,7 @@ const upload = multer({
 // Subscriptions
 // -------------------------
 
-app.post("/api/channels/:channelId/subscribe", requireAuth, async (req, res) => {
+app.post("/api/channels/:channelId/subscribe", requireVerifiedEmail, async (req, res) => {
   const subscriberId = Number(req.user.id);
   const channelId = Number(req.params.channelId);
 
@@ -480,6 +482,16 @@ function runCmd(cmd, args) {
     });
   });
 }
+
+  async function requireVerifiedEmail(req, res, next) {
+    const user = req.user ?? (await getUserFromSession(req));
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+    if (!user.emailVerified) {
+      return res.status(403).json({ error: "Please verify your email first" });
+    }
+    req.user = user;
+    next();
+  }
 
 async function generateHls(inputPath, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
@@ -823,11 +835,13 @@ async function toApiVideo(req, v) {
 registerGenerateProjects(app, {
   pool,
   requireAuth,
+  requireVerifiedEmail,
 });
 
 registerGeneratePublish(app, {
   pool,
   requireAuth,
+  requireVerifiedEmail,
   uploadFileToS3,
   VIDEO_SOURCE,
   VIDEO_DIR,
@@ -991,7 +1005,7 @@ app.delete("/api/videos/:id", requireAuth, async (req, res) => {
   }
 });
 
-app.delete("/api/comments/:commentId", requireAuth, async (req, res) => {
+app.delete("/api/comments/:commentId", requireVerifiedEmail, async (req, res) => {
   const commentId = Number(req.params.commentId);
   const userId = Number(req.user.id);
 
@@ -1231,7 +1245,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
   }
 });
 
-app.post("/api/videos/:videoId/comments", requireAuth, async (req, res) => {
+app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res) => {
   try {
     const videoId = req.params.videoId;
     const userId = req.user.id;
@@ -1308,7 +1322,7 @@ app.post("/api/videos/:videoId/comments", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/comments/:commentId/toggle-like", requireAuth, async (req, res) => {
+app.post("/api/comments/:commentId/toggle-like", requireVerifiedEmail, async (req, res) => {
   const commentId = Number(req.params.commentId);
   const userId = req.user.id;
 
@@ -1413,7 +1427,7 @@ app.get("/api/videos/:id/my-rating", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/videos/:id/rate", requireAuth, async (req, res) => {
+app.post("/api/videos/:id/rate", requireVerifiedEmail, async (req, res) => {
   const videoId = String(req.params.id);
   const userId = String(req.user.id);
   const rating = Number(req.body.rating);
@@ -1530,7 +1544,7 @@ app.post("/api/beta-signup", async (req, res) => {
 });
 
 
-app.post("/api/videos/:id/history", requireAuth, async (req, res) => {
+app.post("/api/videos/:id/history", requireVerifiedEmail, async (req, res) => {
   const videoId = String(req.params.id);
   const userId = Number(req.user.id);
   const progressSeconds = Number(req.body?.progressSeconds || 0);

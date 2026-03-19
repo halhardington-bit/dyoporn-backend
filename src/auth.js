@@ -2,16 +2,15 @@ import express from "express";
 import bcrypt from "bcrypt";
 import { v4 as uuid } from "uuid";
 import { pool } from "./db.js";
+import {
+  createEmailVerificationToken,
+  invalidateUnusedVerificationTokens,
+  sendVerificationEmail,
+  hashToken,
+} from "./mailer.js";
 
 const router = express.Router();
 
-/**
- * Cookie config:
- * - In production (Render/Vercel): cross-site cookie needs SameSite=None + Secure
- * - In dev (localhost): SameSite=Lax and Secure=false is fine
- *
- * Make sure server.js has: app.set("trust proxy", 1)
- */
 function cookieOptions() {
   const days = Number(process.env.SESSION_DAYS || 7);
   const isProd = process.env.NODE_ENV === "production";
@@ -20,14 +19,11 @@ function cookieOptions() {
     httpOnly: true,
     maxAge: days * 24 * 60 * 60 * 1000,
     path: "/",
-
-    // cross-site cookie support (Vercel -> Render)
     sameSite: isProd ? "none" : "lax",
-    secure: isProd, // required for SameSite=None
+    secure: isProd,
   };
 }
 
-/* helpers */
 async function createSession(userId, res) {
   const sessionId = uuid();
   const days = Number(process.env.SESSION_DAYS || 7);
@@ -43,9 +39,33 @@ async function createSession(userId, res) {
   res.cookie("session_id", sessionId, cookieOptions());
 }
 
+async function getUserBySessionId(sessionId) {
+  const result = await pool.query(
+    `
+    SELECT
+      u.id,
+      u.email,
+      u.username,
+      u.tokens,
+      u.rating,
+      u.review_count,
+      u.email_verified,
+      u.email_verified_at
+    FROM sessions s
+    JOIN users u ON u.id = s.user_id
+    WHERE s.id = $1 AND s.expires_at > now()
+    `,
+    [sessionId]
+  );
+
+  return result.rows[0] || null;
+}
+
 /* register */
 router.post("/register", async (req, res) => {
-  const { email, username, password } = req.body;
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const username = String(req.body?.username || "").trim();
+  const password = String(req.body?.password || "");
 
   if (!email || !username || !password) {
     return res.status(400).json({ error: "Missing fields" });
@@ -58,13 +78,27 @@ router.post("/register", async (req, res) => {
       `
       INSERT INTO users (email, username, password_hash)
       VALUES ($1, $2, $3)
-      RETURNING id, username, tokens, rating, review_count
+      RETURNING id, email, username, tokens, rating, review_count, email_verified
       `,
       [email, username, passwordHash]
     );
 
     const user = result.rows[0];
+
     await createSession(user.id, res);
+
+    try {
+      await invalidateUnusedVerificationTokens(user.id);
+      const rawToken = await createEmailVerificationToken(user.id);
+
+      await sendVerificationEmail({
+        email: user.email,
+        username: user.username,
+        rawToken,
+      });
+    } catch (mailErr) {
+      console.error("Verification email send failed:", mailErr);
+    }
 
     res.json({
       id: user.id,
@@ -72,15 +106,18 @@ router.post("/register", async (req, res) => {
       tokens: user.tokens,
       rating: user.rating,
       reviewCount: user.review_count,
+      emailVerified: !!user.email_verified,
     });
   } catch (err) {
+    console.error("Register error:", err);
     res.status(400).json({ error: "User already exists" });
   }
 });
 
 /* login */
 router.post("/login", async (req, res) => {
-  const { email, password } = req.body;
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  const password = String(req.body?.password || "");
 
   const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
   const user = result.rows[0];
@@ -98,7 +135,95 @@ router.post("/login", async (req, res) => {
     tokens: user.tokens,
     rating: user.rating,
     reviewCount: user.review_count,
+    emailVerified: !!user.email_verified,
   });
+});
+
+/* verify email */
+router.post("/verify-email", async (req, res) => {
+  const rawToken = String(req.body?.token || "").trim();
+  if (!rawToken) {
+    return res.status(400).json({ error: "Missing token" });
+  }
+
+  const tokenHash = hashToken(rawToken);
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, user_id
+      FROM email_verification_tokens
+      WHERE token_hash = $1
+        AND used_at IS NULL
+        AND expires_at > now()
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      return res.status(400).json({ error: "Invalid or expired verification token" });
+    }
+
+    await pool.query("BEGIN");
+
+    await pool.query(
+      `
+      UPDATE users
+      SET email_verified = true,
+          email_verified_at = now()
+      WHERE id = $1
+      `,
+      [row.user_id]
+    );
+
+    await pool.query(
+      `
+      UPDATE email_verification_tokens
+      SET used_at = now()
+      WHERE id = $1
+      `,
+      [row.id]
+    );
+
+    await pool.query("COMMIT");
+
+    return res.json({ ok: true, emailVerified: true });
+  } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
+    console.error("Verify email error:", err);
+    return res.status(500).json({ error: "Failed to verify email" });
+  }
+});
+
+/* resend verification */
+router.post("/resend-verification", async (req, res) => {
+  const sid = req.cookies?.session_id;
+  if (!sid) return res.status(401).json({ error: "Not logged in" });
+
+  try {
+    const user = await getUserBySessionId(sid);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+
+    if (user.email_verified) {
+      return res.json({ ok: true, alreadyVerified: true });
+    }
+
+    await invalidateUnusedVerificationTokens(user.id);
+    const rawToken = await createEmailVerificationToken(user.id);
+
+    await sendVerificationEmail({
+      email: user.email,
+      username: user.username,
+      rawToken,
+    });
+
+    return res.json({ ok: true, alreadyVerified: false });
+  } catch (err) {
+    console.error("Resend verification error:", err);
+    return res.status(500).json({ error: "Failed to resend verification email" });
+  }
 });
 
 /* logout */
@@ -109,7 +234,6 @@ router.post("/logout", async (req, res) => {
     await pool.query(`DELETE FROM sessions WHERE id = $1`, [sid]);
   }
 
-  // Must match cookie options to reliably clear it
   res.clearCookie("session_id", cookieOptions());
   res.json({ ok: true });
 });
@@ -121,7 +245,13 @@ router.get("/me", async (req, res) => {
 
   const result = await pool.query(
     `
-    SELECT u.id, u.username, u.tokens, u.rating, u.review_count
+    SELECT
+      u.id,
+      u.username,
+      u.tokens,
+      u.rating,
+      u.review_count,
+      u.email_verified
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -137,6 +267,7 @@ router.get("/me", async (req, res) => {
     tokens: result.rows[0].tokens,
     rating: result.rows[0].rating,
     reviewCount: result.rows[0].review_count,
+    emailVerified: !!result.rows[0].email_verified,
   });
 });
 
