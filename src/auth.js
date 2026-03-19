@@ -7,6 +7,9 @@ import {
   invalidateUnusedVerificationTokens,
   sendVerificationEmail,
   hashToken,
+  createPasswordResetToken,
+  invalidateUnusedPasswordResetTokens,
+  sendPasswordResetEmail,
 } from "./mailer.js";
 
 const router = express.Router();
@@ -60,6 +63,119 @@ async function getUserBySessionId(sessionId) {
 
   return result.rows[0] || null;
 }
+
+router.post("/reset-password", async (req, res) => {
+  const rawToken = String(req.body?.token || "").trim();
+  const password = String(req.body?.password || "");
+
+  if (!rawToken) {
+    return res.status(400).json({ error: "Missing token" });
+  }
+
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: "Password must be at least 8 characters" });
+  }
+
+  const tokenHash = hashToken(rawToken);
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, user_id
+      FROM password_reset_tokens
+      WHERE token_hash = $1
+        AND used_at IS NULL
+        AND expires_at > now()
+      LIMIT 1
+      `,
+      [tokenHash]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      return res.status(400).json({ error: "Invalid or expired reset token" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    await pool.query("BEGIN");
+
+    await pool.query(
+      `
+      UPDATE users
+      SET password_hash = $2
+      WHERE id = $1
+      `,
+      [row.user_id, passwordHash]
+    );
+
+    await pool.query(
+      `
+      UPDATE password_reset_tokens
+      SET used_at = now()
+      WHERE id = $1
+      `,
+      [row.id]
+    );
+
+    await pool.query(
+      `
+      DELETE FROM sessions
+      WHERE user_id = $1
+      `,
+      [row.user_id]
+    );
+
+    await pool.query("COMMIT");
+
+    return res.json({ ok: true });
+  } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
+    console.error("Reset password error:", err);
+    return res.status(500).json({ error: "Failed to reset password" });
+  }
+});
+
+router.post("/forgot-password", async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+
+  if (!email) {
+    return res.status(400).json({ error: "Email is required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT id, email, username
+      FROM users
+      WHERE email = $1
+      LIMIT 1
+      `,
+      [email]
+    );
+
+    const user = result.rows[0];
+
+    if (user) {
+      await invalidateUnusedPasswordResetTokens(user.id);
+      const rawToken = await createPasswordResetToken(user.id);
+
+      await sendPasswordResetEmail({
+        email: user.email,
+        username: user.username,
+        rawToken,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message: "If that email exists, a password reset link has been sent.",
+    });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    return res.status(500).json({ error: "Failed to process password reset request" });
+  }
+});
 
 /* register */
 router.post("/register", async (req, res) => {
