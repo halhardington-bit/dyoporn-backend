@@ -1399,6 +1399,81 @@ app.get("/api/home", async (req, res) => {
   }
 });
 
+app.patch("/api/videos/:id", requireAuth, async (req, res) => {
+  const videoId = String(req.params.id);
+  const userId = Number(req.user.id);
+
+  try {
+    const existing = await pool.query(
+      `
+      SELECT id, user_id
+      FROM videos
+      WHERE id::text = $1::text
+      LIMIT 1
+      `,
+      [videoId]
+    );
+
+    const video = existing.rows[0];
+    if (!video) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    if (Number(video.user_id) !== userId) {
+      return res.status(403).json({ error: "Not allowed" });
+    }
+
+    const rawTitle = String(req.body?.title ?? "").trim();
+    const rawDescription = String(req.body?.description ?? "");
+    const rawTags = Array.isArray(req.body?.tags) ? req.body.tags : [];
+
+    if (!rawTitle) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
+    if (rawTitle.length > 120) {
+      return res.status(400).json({ error: "Title is too long" });
+    }
+
+    if (rawDescription.length > 5000) {
+      return res.status(400).json({ error: "Description is too long" });
+    }
+
+    const tags = Array.from(
+      new Set(
+        rawTags
+          .map((t) => String(t || "").trim().toLowerCase())
+          .filter(Boolean)
+          .slice(0, 30)
+      )
+    );
+
+    await pool.query(
+      `
+      UPDATE videos
+      SET
+        title = $2,
+        description = $3,
+        tags = $4::text[],
+        updated_at = NOW()
+      WHERE id::text = $1::text
+      `,
+      [videoId, rawTitle, rawDescription, tags]
+    );
+
+    const fresh = await fetchVideoById(videoId);
+    if (!fresh) {
+      return res.status(404).json({ error: "Video not found after update" });
+    }
+
+    const apiVideo = await toApiVideo(req, fresh);
+    return res.json({ ok: true, video: apiVideo });
+  } catch (e) {
+    console.error("PATCH /api/videos/:id error:", e);
+    return res.status(500).json({ error: "Failed to update video" });
+  }
+});
+
 
 app.delete("/api/videos/:id", requireAuth, async (req, res) => {
   const videoId = String(req.params.id);
