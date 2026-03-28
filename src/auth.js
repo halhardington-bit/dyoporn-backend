@@ -55,7 +55,8 @@ async function getUserBySessionId(sessionId) {
       u.review_count,
       u.email_verified,
       u.email_verified_at,
-      u.is_moderator
+      u.is_moderator,
+      u.tier
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -380,9 +381,11 @@ router.get("/me", async (req, res) => {
       u.username,
       u.tokens,
       u.rating,
+      u.tier,
       u.review_count,
       u.email_verified,
-      u.is_moderator
+      u.is_moderator,
+      u.tier
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -401,6 +404,7 @@ router.get("/me", async (req, res) => {
     rating: result.rows[0].rating,
     reviewCount: result.rows[0].review_count,
     isModerator: !!result.rows[0].is_moderator,
+    tier: result.rows[0].review_count,
     emailVerified: !!result.rows[0].email_verified,
   });
 });

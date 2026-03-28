@@ -261,6 +261,7 @@ async function getUserFromSession(req) {
     u.tokens,
     u.email_verified,
     u.is_moderator,
+    u.tier,
     COALESCE(AVG(vr.rating)::float, 0) AS rating,
     COALESCE(COUNT(vr.rating)::int, 0) AS review_count
   FROM sessions s
@@ -284,6 +285,7 @@ async function getUserFromSession(req) {
     rating: u.rating,
     isModerator: !!u.is_moderator,
     reviewCount: u.review_count,
+    tier: u.tier,
     emailVerified: !!u.email_verified,
   };
 }
