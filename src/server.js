@@ -19,6 +19,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { registerGeneratePublish } from "./generatePublish.js";
 import { registerGenerateProjects } from "./generateProjects.js";
+import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 
 
 // ✅ S3 helpers (single import, consistent exports)
@@ -259,6 +260,7 @@ async function getUserFromSession(req) {
     u.username,
     u.tokens,
     u.email_verified,
+    u.is_moderator,
     COALESCE(AVG(vr.rating)::float, 0) AS rating,
     COALESCE(COUNT(vr.rating)::int, 0) AS review_count
   FROM sessions s
@@ -280,6 +282,7 @@ async function getUserFromSession(req) {
     username: u.username,
     tokens: u.tokens,
     rating: u.rating,
+    isModerator: !!u.is_moderator,
     reviewCount: u.review_count,
     emailVerified: !!u.email_verified,
   };
@@ -298,6 +301,193 @@ app.use(async (req, _res, next) => {
 async function requireAuth(req, res, next) {
   const user = req.user ?? (await getUserFromSession(req));
   if (!user) return res.status(401).json({ error: "Not logged in" });
+  req.user = user;
+  next();
+}
+
+app.get("/api/me/media-key", requireAuth, async (req, res) => {
+  try {
+    const mediaKey = await getOrCreateUserMediaKey(req.user.id);
+    return res.json({ mediaKey });
+  } catch (e) {
+    console.error("GET /api/me/media-key error:", e);
+    return res.status(500).json({ error: "Failed to get media key" });
+  }
+});
+
+
+app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
+  const archived = String(req.query.archived || "0") === "1";
+  const q = String(req.query.q || "").trim();
+  const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
+  const offset = Math.max(Number(req.query.offset || 0), 0);
+
+  try {
+    const where = [`r.status = $1`];
+    const params = [archived ? "archived" : "open"];
+    let i = 2;
+
+    if (q) {
+      where.push(`
+        (
+          CAST(v.id AS text) ILIKE $${i}
+          OR v.title ILIKE $${i}
+          OR CAST(v.user_id AS text) ILIKE $${i}
+          OR u.username ILIKE $${i}
+          OR COALESCE(p.display_name, '') ILIKE $${i}
+          OR CAST(r.reporter_id AS text) ILIKE $${i}
+          OR r.offense ILIKE $${i}
+          OR COALESCE(r.comments, '') ILIKE $${i}
+        )
+      `);
+      params.push(`%${q}%`);
+      i++;
+    }
+
+    params.push(limit);
+    params.push(offset);
+
+    const result = await pool.query(
+      `
+      SELECT
+        r.id,
+        r.video_id,
+        r.reporter_id,
+        r.offense,
+        r.comments,
+        r.status,
+        r.action_taken,
+        r.addressed_at,
+        r.created_at,
+
+        v.title AS video_title,
+        v.visibility,
+        v.user_id AS video_owner_id,
+
+        u.username AS channel_username,
+        COALESCE(p.display_name, '') AS channel_display_name,
+
+        ru.username AS reporter_username,
+        COALESCE(rp.display_name, '') AS reporter_display_name
+      FROM video_reports r
+      JOIN videos v ON v.id::text = r.video_id::text
+      JOIN users u ON u.id = v.user_id
+      LEFT JOIN user_profiles p ON p.user_id = u.id
+      LEFT JOIN users ru ON ru.id = r.reporter_id
+      LEFT JOIN user_profiles rp ON rp.user_id = ru.id
+      WHERE ${where.join(" AND ")}
+      ORDER BY
+        CASE WHEN r.status = 'open' THEN r.created_at END DESC,
+        CASE WHEN r.status = 'archived' THEN r.addressed_at END DESC,
+        r.id DESC
+      LIMIT $${i} OFFSET $${i + 1}
+      `,
+      params
+    );
+
+    return res.json(
+      result.rows.map((row) => ({
+        id: row.id,
+        videoId: row.video_id,
+        videoTitle: row.video_title,
+        visibility: row.visibility,
+
+        userId: row.video_owner_id,
+        username: row.channel_username,
+        displayName: row.channel_display_name || row.channel_username,
+
+        reporterId: row.reporter_id,
+        reporterUsername: row.reporter_username || null,
+        reporterDisplayName:
+          row.reporter_display_name || row.reporter_username || null,
+
+        offense: row.offense,
+        comments: row.comments || "",
+        status: row.status,
+        actionTaken: row.action_taken || null,
+        createdAt: row.created_at,
+        addressedAt: row.addressed_at,
+      }))
+    );
+  } catch (e) {
+    console.error("GET /api/mod/reports error:", e);
+    return res.status(500).json({ error: "Failed to load reports" });
+  }
+});
+
+app.post("/api/mod/reports/:reportId/resolve", requireAuth, requireModerator, async (req, res) => {
+  const reportId = Number(req.params.reportId);
+  const action = String(req.body?.action || "").trim().toLowerCase();
+
+  if (!Number.isFinite(reportId)) {
+    return res.status(400).json({ error: "Invalid report id" });
+  }
+
+  if (!["pass", "fail"].includes(action)) {
+    return res.status(400).json({ error: "Action must be pass or fail" });
+  }
+
+  try {
+    await pool.query("BEGIN");
+
+    const reportRes = await pool.query(
+      `
+      SELECT r.id, r.video_id, r.status
+      FROM video_reports r
+      WHERE r.id = $1
+      LIMIT 1
+      `,
+      [reportId]
+    );
+
+    const report = reportRes.rows[0];
+    if (!report) {
+      await pool.query("ROLLBACK");
+      return res.status(404).json({ error: "Report not found" });
+    }
+
+    if (report.status !== "open") {
+      await pool.query("ROLLBACK");
+      return res.status(400).json({ error: "Report already addressed" });
+    }
+
+    if (action === "fail") {
+      await pool.query(
+        `
+        UPDATE videos
+        SET visibility = 'blacklisted',
+            updated_at = NOW()
+        WHERE id::text = $1::text
+        `,
+        [String(report.video_id)]
+      );
+    }
+
+    await pool.query(
+      `
+      UPDATE video_reports
+      SET
+        status = 'archived',
+        action_taken = $2,
+        addressed_at = NOW()
+      WHERE id = $1
+      `,
+      [reportId, action]
+    );
+
+    await pool.query("COMMIT");
+    return res.json({ ok: true, id: reportId, action });
+  } catch (e) {
+    await pool.query("ROLLBACK").catch(() => {});
+    console.error("POST /api/mod/reports/:reportId/resolve error:", e);
+    return res.status(500).json({ error: "Failed to resolve report" });
+  }
+});
+
+async function requireModerator(req, res, next) {
+  const user = req.user ?? (await getUserFromSession(req));
+  if (!user) return res.status(401).json({ error: "Not logged in" });
+  if (!user.isModerator) return res.status(403).json({ error: "Forbidden" });
   req.user = user;
   next();
 }
@@ -1030,6 +1220,143 @@ app.get("/api/profile/u/:username/videos", async (req, res) => {
   } catch (e) {
     console.error("GET /api/profile/u/:username/videos error:", e);
     return res.status(500).json({ error: "Failed to load user videos" });
+  }
+});
+
+
+// -------------------------
+// Watch Later
+// -------------------------
+
+app.get("/api/me/watch-later", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        v.id,
+        v.user_id,
+        v.title,
+        v.description,
+        v.category,
+        v.visibility,
+        v.media_type,
+        v.asset_scope,
+        v.filename,
+        v.thumb,
+        v.duration_text,
+        v.duration,
+        v.views,
+        v.tags,
+        v.created_at AS "createdAt",
+        v.updated_at AS "updatedAt",
+        u.username AS channel_username,
+        COALESCE(p.display_name, '') AS channel_display_name,
+        wl.created_at AS saved_at
+      FROM watch_later wl
+      JOIN videos v ON v.id::text = wl.video_id::text
+      JOIN users u ON u.id = v.user_id
+      LEFT JOIN user_profiles p ON p.user_id = u.id
+      WHERE wl.user_id = $1
+        AND v.visibility = 'public'
+        AND v.asset_scope = 'public'
+        AND v.media_type = 'video'
+      ORDER BY wl.created_at DESC
+      LIMIT 200
+      `,
+      [userId]
+    );
+
+    const enriched = await Promise.all(
+      result.rows.map(async (v) => {
+        const apiVideo = await toApiVideo(req, v);
+        return {
+          ...apiVideo,
+          savedAt: v.saved_at || null,
+        };
+      })
+    );
+
+    return res.json(enriched);
+  } catch (e) {
+    console.error("GET /api/me/watch-later error:", e);
+    return res.status(500).json({ error: "Failed to load Watch Later" });
+  }
+});
+
+app.get("/api/me/watch-later/:videoId", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+  const videoId = String(req.params.videoId);
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT created_at
+      FROM watch_later
+      WHERE user_id = $1 AND video_id = $2
+      LIMIT 1
+      `,
+      [userId, videoId]
+    );
+
+    return res.json({
+      saved: result.rowCount > 0,
+      savedAt: result.rows[0]?.created_at ?? null,
+    });
+  } catch (e) {
+    console.error("GET /api/me/watch-later/:videoId error:", e);
+    return res.status(500).json({ error: "Failed to load Watch Later status" });
+  }
+});
+
+app.post("/api/me/watch-later/:videoId", requireVerifiedEmail, async (req, res) => {
+  const userId = Number(req.user.id);
+  const videoId = String(req.params.videoId);
+
+  try {
+    const exists = await pool.query(
+      `SELECT id FROM videos WHERE id::text = $1::text LIMIT 1`,
+      [videoId]
+    );
+
+    if (!exists.rows.length) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO watch_later (user_id, video_id)
+      VALUES ($1, $2)
+      ON CONFLICT (user_id, video_id) DO NOTHING
+      `,
+      [userId, videoId]
+    );
+
+    return res.json({ ok: true, saved: true, videoId });
+  } catch (e) {
+    console.error("POST /api/me/watch-later/:videoId error:", e);
+    return res.status(500).json({ error: "Failed to add to Watch Later" });
+  }
+});
+
+app.delete("/api/me/watch-later/:videoId", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+  const videoId = String(req.params.videoId);
+
+  try {
+    await pool.query(
+      `
+      DELETE FROM watch_later
+      WHERE user_id = $1 AND video_id = $2
+      `,
+      [userId, videoId]
+    );
+
+    return res.json({ ok: true, saved: false, videoId });
+  } catch (e) {
+    console.error("DELETE /api/me/watch-later/:videoId error:", e);
+    return res.status(500).json({ error: "Failed to remove from Watch Later" });
   }
 });
 
@@ -2143,6 +2470,59 @@ app.delete("/api/me/history", requireAuth, async (req, res) => {
 });
 
 
+app.post("/api/videos/:id/report", requireAuth, async (req, res) => {
+  const videoId = String(req.params.id || "");
+  const offense = String(req.body?.offense || "").trim();
+  const comments = String(req.body?.comments || "").trim();
+
+  const allowedOffenses = new Set([
+    "Spam or misleading",
+    "Harassment or bullying",
+    "Hateful or abusive content",
+    "Violence or dangerous acts",
+    "Sexual content",
+    "Copyright or stolen content",
+    "Other",
+  ]);
+
+  if (!videoId) {
+    return res.status(400).json({ error: "Missing video id" });
+  }
+
+  if (!allowedOffenses.has(offense)) {
+    return res.status(400).json({ error: "Invalid report reason" });
+  }
+
+  if (comments.length > 2000) {
+    return res.status(400).json({ error: "Comments are too long" });
+  }
+
+  try {
+    const exists = await pool.query(
+      `SELECT id FROM videos WHERE id::text = $1::text LIMIT 1`,
+      [videoId]
+    );
+
+    if (!exists.rows.length) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    await pool.query(
+      `
+      INSERT INTO video_reports (video_id, reporter_id, offense, comments)
+      VALUES ($1, $2, $3, $4)
+      `,
+      [videoId, req.user.id, offense, comments]
+    );
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("POST /api/videos/:id/report error:", e);
+    return res.status(500).json({ error: "Failed to submit report" });
+  }
+});
+
+
 // -------------------------
 // Videos API
 // -------------------------
@@ -2154,6 +2534,64 @@ app.get("/api/videos", async (req, res) => {
     const filter = String(req.query.filter || "").toLowerCase().trim();
 
     const requesterId = req.user?.id ? Number(req.user.id) : null;
+
+        // -------------------------
+    // Watch Later mode
+    // -------------------------
+    if (filter === "watch-later") {
+      if (!requesterId) {
+        return res.status(401).json({ error: "Not logged in" });
+      }
+
+      const watchLaterResult = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.duration,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name,
+          wl.created_at AS saved_at
+        FROM watch_later wl
+        JOIN videos v ON v.id::text = wl.video_id::text
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE wl.user_id = $1
+          AND v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY wl.created_at DESC
+        LIMIT 200
+        `,
+        [requesterId]
+      );
+
+      const enriched = await Promise.all(
+        watchLaterResult.rows.map(async (v) => {
+          const apiVideo = await toApiVideo(req, v);
+          return {
+            ...apiVideo,
+            savedAt: v.saved_at || null,
+          };
+        })
+      );
+
+      return res.json(enriched);
+    }
+
 
         // -------------------------
     // Watch History mode

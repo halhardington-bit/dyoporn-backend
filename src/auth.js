@@ -2,6 +2,7 @@ import express from "express";
 import bcrypt from "bcrypt";
 import { v4 as uuid } from "uuid";
 import { pool } from "./db.js";
+import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 import {
   createEmailVerificationToken,
   invalidateUnusedVerificationTokens,
@@ -53,7 +54,8 @@ async function getUserBySessionId(sessionId) {
       u.rating,
       u.review_count,
       u.email_verified,
-      u.email_verified_at
+      u.email_verified_at,
+      u.is_moderator
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -194,13 +196,22 @@ router.post("/register", async (req, res) => {
       `
       INSERT INTO users (email, username, password_hash)
       VALUES ($1, $2, $3)
-      RETURNING id, email, username, tokens, rating, review_count, email_verified
+      RETURNING
+        id,
+        email,
+        username,
+        tokens,
+        rating,
+        review_count,
+        email_verified,
+        is_moderator
       `,
       [email, username, passwordHash]
     );
 
     const user = result.rows[0];
 
+    await getOrCreateUserMediaKey(user.id);
     await createSession(user.id, res);
 
     try {
@@ -222,6 +233,7 @@ router.post("/register", async (req, res) => {
       tokens: user.tokens,
       rating: user.rating,
       reviewCount: user.review_count,
+      isModerator: !!user.is_moderator,
       emailVerified: !!user.email_verified,
     });
   } catch (err) {
@@ -243,6 +255,7 @@ router.post("/login", async (req, res) => {
   const ok = await bcrypt.compare(password, user.password_hash);
   if (!ok) return res.status(401).json({ error: "Invalid credentials" });
 
+  await getOrCreateUserMediaKey(user.id);
   await createSession(user.id, res);
 
   res.json({
@@ -252,6 +265,7 @@ router.post("/login", async (req, res) => {
     rating: user.rating,
     reviewCount: user.review_count,
     emailVerified: !!user.email_verified,
+    isModerator: !!user.is_moderator,
   });
 });
 
@@ -367,7 +381,8 @@ router.get("/me", async (req, res) => {
       u.tokens,
       u.rating,
       u.review_count,
-      u.email_verified
+      u.email_verified,
+      u.is_moderator
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -377,12 +392,15 @@ router.get("/me", async (req, res) => {
 
   if (!result.rows[0]) return res.status(401).json(null);
 
+  await getOrCreateUserMediaKey(result.rows[0].id);
+
   res.json({
     id: result.rows[0].id,
     username: result.rows[0].username,
     tokens: result.rows[0].tokens,
     rating: result.rows[0].rating,
     reviewCount: result.rows[0].review_count,
+    isModerator: !!result.rows[0].is_moderator,
     emailVerified: !!result.rows[0].email_verified,
   });
 });
