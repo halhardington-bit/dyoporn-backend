@@ -404,7 +404,7 @@ router.get("/me", async (req, res) => {
     rating: result.rows[0].rating,
     reviewCount: result.rows[0].review_count,
     isModerator: !!result.rows[0].is_moderator,
-    tier: result.rows[0].review_count,
+    tier: result.rows[0].tier,
     emailVerified: !!result.rows[0].email_verified,
   });
 });

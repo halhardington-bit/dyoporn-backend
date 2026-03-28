@@ -307,6 +307,33 @@ async function requireAuth(req, res, next) {
   next();
 }
 
+app.patch("/api/me/tier", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+  const tier = String(req.body?.tier || "").trim();
+
+  const allowedTiers = new Set(["Free", "Watcher", "Basic", "Premium"]);
+
+  if (!allowedTiers.has(tier)) {
+    return res.status(400).json({ error: "Invalid tier" });
+  }
+
+  try {
+    await pool.query(
+      `
+      UPDATE users
+      SET tier = $2
+      WHERE id = $1
+      `,
+      [userId, tier]
+    );
+
+    return res.json({ ok: true, tier });
+  } catch (e) {
+    console.error("PATCH /api/me/tier error:", e);
+    return res.status(500).json({ error: "Failed to update tier" });
+  }
+});
+
 app.get("/api/me/media-key", requireAuth, async (req, res) => {
   try {
     const mediaKey = await getOrCreateUserMediaKey(req.user.id);
