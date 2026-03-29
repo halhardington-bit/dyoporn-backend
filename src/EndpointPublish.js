@@ -34,6 +34,19 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
+function formatDurationText(totalSeconds) {
+  const secs = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const hours = Math.floor(secs / 3600);
+  const minutes = Math.floor((secs % 3600) / 60);
+  const seconds = secs % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+  }
+
+  return `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
 function makeAssetsS3Client() {
   const region =
     process.env.S3_ASSETS_REGION ||
@@ -321,7 +334,7 @@ export function registerEndpointPublish(app, deps = {}) {
       },
     }),
     limits: {
-      fileSize: 1024 * 1024 * 1024, // 1 GB
+      fileSize: 1024 * 1024 * 1024,
     },
   });
 
@@ -405,6 +418,10 @@ export function registerEndpointPublish(app, deps = {}) {
           authTagB64: authTag,
         });
 
+        const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
+        const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
+        const durationText = formatDurationText(durationSeconds);
+
         const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
         const thumbPath = path.join(outDir, thumbName);
 
@@ -454,13 +471,24 @@ export function registerEndpointPublish(app, deps = {}) {
             filename,
             thumb,
             duration_text,
+            duration,
             views,
             tags
           )
-          VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, NULL, 0, $7)
+          VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9)
           RETURNING id
           `,
-          [userId, title, description, visibility, hlsMasterKey, thumbKey, tags]
+          [
+            userId,
+            title,
+            description,
+            visibility,
+            hlsMasterKey,
+            thumbKey,
+            durationText,
+            durationSeconds,
+            tags,
+          ]
         );
 
         const newVideoId = ins.rows[0].id;
@@ -472,6 +500,8 @@ export function registerEndpointPublish(app, deps = {}) {
           videoId: newVideoId,
           filename: hlsMasterKey,
           thumb: thumbKey,
+          duration: durationSeconds,
+          durationText,
           ms: Date.now() - startedAt,
         });
       } catch (e) {
