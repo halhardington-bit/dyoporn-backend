@@ -20,6 +20,7 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { registerGeneratePublish } from "./generatePublish.js";
 import { registerGenerateProjects } from "./generateProjects.js";
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
+import { registerEndpointPublish } from "./EndpointPublish.js";
 
 
 // ✅ S3 helpers (single import, consistent exports)
@@ -1139,6 +1140,12 @@ async function buildHomeRow({
 
   return { key, title, videos };
 }
+
+registerEndpointPublish(app, {
+  pool,
+  requireAuth,
+  uploadFileToS3,
+});
 
 registerGenerateProjects(app, {
   pool,
