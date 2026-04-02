@@ -1,5 +1,8 @@
 import express from "express";
 import bcrypt from "bcrypt";
+import crypto from "crypto";
+import passport from "passport";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
 import { v4 as uuid } from "uuid";
 import { pool } from "./db.js";
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
@@ -57,6 +60,10 @@ function normalizeCountry(value) {
   return country || null;
 }
 
+function makeRandomPassword() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
 async function createSession(userId, res) {
   const sessionId = uuid();
   const days = Number(process.env.SESSION_DAYS || 7);
@@ -97,6 +104,113 @@ async function getUserBySessionId(sessionId) {
 
   return result.rows[0] || null;
 }
+
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL:
+        process.env.NODE_ENV === "production"
+          ? "https://api.dyop.ai/auth/google/callback"
+          : "http://localhost:3001/auth/google/callback",
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const provider = "google";
+        const providerUserId = String(profile.id);
+        const email =
+          profile.emails?.[0]?.value?.trim().toLowerCase() || null;
+        const displayName =
+          profile.displayName?.trim() ||
+          profile.name?.givenName?.trim() ||
+          "user";
+
+        const identityResult = await pool.query(
+          `
+          SELECT u.id, u.username
+          FROM user_identities ui
+          JOIN users u ON u.id = ui.user_id
+          WHERE ui.provider = $1 AND ui.provider_user_id = $2
+          LIMIT 1
+          `,
+          [provider, providerUserId]
+        );
+
+        if (identityResult.rows[0]) {
+          return done(null, { id: identityResult.rows[0].id });
+        }
+
+        // No auto-linking by email in this version.
+        const baseUsername = displayName
+          .toLowerCase()
+          .replace(/[^a-z0-9_]/g, "_")
+          .replace(/_+/g, "_")
+          .replace(/^_+|_+$/g, "")
+          .slice(0, 24) || "user";
+
+        let username = baseUsername;
+        let suffix = 1;
+
+        while (true) {
+          const existing = await pool.query(
+            `SELECT id FROM users WHERE username = $1 LIMIT 1`,
+            [username]
+          );
+          if (!existing.rows[0]) break;
+          suffix += 1;
+          username = `${baseUsername}_${suffix}`.slice(0, 32);
+        }
+
+        const randomPassword = makeRandomPassword();
+        const passwordHash = await bcrypt.hash(randomPassword, 12);
+
+        await pool.query("BEGIN");
+
+        const userInsert = await pool.query(
+          `
+          INSERT INTO users (
+            email,
+            username,
+            password_hash,
+            email_verified
+          )
+          VALUES ($1, $2, $3, $4)
+          RETURNING id
+          `,
+          [email, username, passwordHash, true]
+        );
+
+        const userId = userInsert.rows[0].id;
+
+        await pool.query(
+          `
+          INSERT INTO user_identities (
+            user_id,
+            provider,
+            provider_user_id,
+            email_at_provider
+          )
+          VALUES ($1, $2, $3, $4)
+          `,
+          [userId, provider, providerUserId, email]
+        );
+
+        await pool.query("COMMIT");
+
+        return done(null, { id: userId });
+      } catch (err) {
+        await pool.query("ROLLBACK").catch(() => {});
+        return done(err);
+      }
+    }
+  )
+);
+
+// Passport session serialize/deserialize are required by passport,
+// but we are still using your own cookie session system for the app.
+passport.serializeUser((user, done) => done(null, user.id));
+passport.deserializeUser((id, done) => done(null, { id }));
 
 router.post("/reset-password", async (req, res) => {
   const rawToken = String(req.body?.token || "").trim();
@@ -215,7 +329,6 @@ router.post("/forgot-password", async (req, res) => {
   }
 });
 
-/* register */
 router.post("/register", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const username = String(req.body?.username || "").trim();
@@ -349,7 +462,6 @@ router.post("/register", async (req, res) => {
   }
 });
 
-/* login */
 router.post("/login", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
@@ -409,7 +521,49 @@ router.post("/login", async (req, res) => {
   }
 });
 
-/* verify email */
+router.get(
+  "/google",
+  passport.authenticate("google", {
+    scope: ["profile", "email"],
+    session: false,
+  })
+);
+
+router.get(
+  "/google/callback",
+  passport.authenticate("google", {
+    failureRedirect:
+      process.env.NODE_ENV === "production"
+        ? `${process.env.FRONTEND_BASE_URL}/?auth=google_failed`
+        : "http://localhost:5173/?auth=google_failed",
+    session: false,
+  }),
+  async (req, res) => {
+    try {
+      const userId = req.user.id;
+
+      await getOrCreateUserMediaKey(userId);
+      await createSession(userId, res);
+
+      const redirectTo =
+        process.env.NODE_ENV === "production"
+          ? `${process.env.FRONTEND_BASE_URL}/?auth=google_success`
+          : "http://localhost:5173/watch?auth=google_success";
+
+      return res.redirect(redirectTo);
+    } catch (err) {
+      console.error("Google callback session error:", err);
+
+      const redirectTo =
+        process.env.NODE_ENV === "production"
+          ? `${process.env.FRONTEND_BASE_URL}/?auth=google_failed`
+          : "http://localhost:5173/?auth=google_failed";
+
+      return res.redirect(redirectTo);
+    }
+  }
+);
+
 router.post("/verify-email", async (req, res) => {
   const rawToken = String(req.body?.token || "").trim();
   if (!rawToken) {
@@ -469,7 +623,6 @@ router.post("/verify-email", async (req, res) => {
   }
 });
 
-/* resend verification */
 router.post("/resend-verification", async (req, res) => {
   const sid = req.cookies?.session_id;
   if (!sid) return res.status(401).json({ error: "Not logged in" });
@@ -500,7 +653,6 @@ router.post("/resend-verification", async (req, res) => {
   }
 });
 
-/* logout */
 router.post("/logout", async (req, res) => {
   const sid = req.cookies?.session_id;
 
@@ -512,7 +664,6 @@ router.post("/logout", async (req, res) => {
   res.json({ ok: true });
 });
 
-/* current user */
 router.get("/me", async (req, res) => {
   const sid = req.cookies?.session_id;
   if (!sid) return res.status(401).json(null);

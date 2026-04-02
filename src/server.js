@@ -22,6 +22,8 @@ import { registerGenerateProjects } from "./generateProjects.js";
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 import { registerEndpointPublish } from "./EndpointPublish.js";
 
+import passport from "passport";
+
 
 // ✅ S3 helpers (single import, consistent exports)
 import {
@@ -226,6 +228,7 @@ app.options(/.*/, cors(corsOptions));
 app.use(morgan("dev"));
 app.use(express.json());
 app.use(cookieParser());
+app.use(passport.initialize());
 
 // -------------------------
 // Paths / storage
