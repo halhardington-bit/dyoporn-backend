@@ -28,6 +28,35 @@ function cookieOptions() {
   };
 }
 
+function isValidEmail(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function calculateAge(dateString) {
+  if (!dateString) return null;
+
+  const birthDate = new Date(dateString);
+  if (Number.isNaN(birthDate.getTime())) return null;
+
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  const monthDiff = today.getMonth() - birthDate.getMonth();
+
+  if (
+    monthDiff < 0 ||
+    (monthDiff === 0 && today.getDate() < birthDate.getDate())
+  ) {
+    age -= 1;
+  }
+
+  return age;
+}
+
+function normalizeCountry(value) {
+  const country = String(value || "").trim();
+  return country || null;
+}
+
 async function createSession(userId, res) {
   const sessionId = uuid();
   const days = Number(process.env.SESSION_DAYS || 7);
@@ -56,7 +85,9 @@ async function getUserBySessionId(sessionId) {
       u.email_verified,
       u.email_verified_at,
       u.is_moderator,
-      u.tier
+      u.tier,
+      u.date_of_birth,
+      u.country
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     WHERE s.id = $1 AND s.expires_at > now()
@@ -76,7 +107,9 @@ router.post("/reset-password", async (req, res) => {
   }
 
   if (!password || password.length < 8) {
-    return res.status(400).json({ error: "Password must be at least 8 characters" });
+    return res
+      .status(400)
+      .json({ error: "Password must be at least 8 characters" });
   }
 
   const tokenHash = hashToken(rawToken);
@@ -176,7 +209,9 @@ router.post("/forgot-password", async (req, res) => {
     });
   } catch (err) {
     console.error("Forgot password error:", err);
-    return res.status(500).json({ error: "Failed to process password reset request" });
+    return res
+      .status(500)
+      .json({ error: "Failed to process password reset request" });
   }
 });
 
@@ -185,9 +220,53 @@ router.post("/register", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const username = String(req.body?.username || "").trim();
   const password = String(req.body?.password || "");
+  const dateOfBirth = String(req.body?.dateOfBirth || "").trim();
+  const country = normalizeCountry(req.body?.country);
 
-  if (!email || !username || !password) {
-    return res.status(400).json({ error: "Missing fields" });
+  if (!email || !username || !password || !dateOfBirth) {
+    return res.status(400).json({
+      error: "Email, username, password, and date of birth are required",
+    });
+  }
+
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: "Please enter a valid email address" });
+  }
+
+  if (username.length < 3) {
+    return res
+      .status(400)
+      .json({ error: "Username must be at least 3 characters" });
+  }
+
+  if (username.length > 32) {
+    return res
+      .status(400)
+      .json({ error: "Username must be 32 characters or fewer" });
+  }
+
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+    return res.status(400).json({
+      error: "Username can only contain letters, numbers, and underscores",
+    });
+  }
+
+  if (password.length < 8) {
+    return res
+      .status(400)
+      .json({ error: "Password must be at least 8 characters" });
+  }
+
+  const age = calculateAge(dateOfBirth);
+
+  if (age == null) {
+    return res.status(400).json({ error: "Please enter a valid date of birth" });
+  }
+
+  if (age < 18) {
+    return res
+      .status(400)
+      .json({ error: "You must be at least 18 years old to create an account" });
   }
 
   const passwordHash = await bcrypt.hash(password, 12);
@@ -195,8 +274,14 @@ router.post("/register", async (req, res) => {
   try {
     const result = await pool.query(
       `
-      INSERT INTO users (email, username, password_hash)
-      VALUES ($1, $2, $3)
+      INSERT INTO users (
+        email,
+        username,
+        password_hash,
+        date_of_birth,
+        country
+      )
+      VALUES ($1, $2, $3, $4, $5)
       RETURNING
         id,
         email,
@@ -205,9 +290,12 @@ router.post("/register", async (req, res) => {
         rating,
         review_count,
         email_verified,
-        is_moderator
+        date_of_birth,
+        country,
+        is_moderator,
+        tier
       `,
-      [email, username, passwordHash]
+      [email, username, passwordHash, dateOfBirth, country]
     );
 
     const user = result.rows[0];
@@ -228,7 +316,7 @@ router.post("/register", async (req, res) => {
       console.error("Verification email send failed:", mailErr);
     }
 
-    res.json({
+    return res.json({
       id: user.id,
       username: user.username,
       tokens: user.tokens,
@@ -236,10 +324,28 @@ router.post("/register", async (req, res) => {
       reviewCount: user.review_count,
       isModerator: !!user.is_moderator,
       emailVerified: !!user.email_verified,
+      tier: user.tier,
+      dateOfBirth: user.date_of_birth,
+      country: user.country,
     });
   } catch (err) {
     console.error("Register error:", err);
-    res.status(400).json({ error: "User already exists" });
+
+    if (err?.code === "23505") {
+      if (String(err.constraint || "").includes("email")) {
+        return res.status(400).json({ error: "An account with that email already exists" });
+      }
+      if (String(err.constraint || "").includes("username")) {
+        return res.status(400).json({ error: "That username is already taken" });
+      }
+      return res.status(400).json({ error: "User already exists" });
+    }
+
+    if (err?.code === "23514") {
+      return res.status(400).json({ error: "Account does not meet age requirements" });
+    }
+
+    return res.status(500).json({ error: "Failed to create account" });
   }
 });
 
@@ -248,26 +354,59 @@ router.post("/login", async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   const password = String(req.body?.password || "");
 
-  const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
-  const user = result.rows[0];
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        id,
+        email,
+        username,
+        password_hash,
+        tokens,
+        rating,
+        review_count,
+        email_verified,
+        is_moderator,
+        tier,
+        date_of_birth,
+        country
+      FROM users
+      WHERE email = $1
+      LIMIT 1
+      `,
+      [email]
+    );
 
-  if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    const user = result.rows[0];
 
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+    if (!user) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
 
-  await getOrCreateUserMediaKey(user.id);
-  await createSession(user.id, res);
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
 
-  res.json({
-    id: user.id,
-    username: user.username,
-    tokens: user.tokens,
-    rating: user.rating,
-    reviewCount: user.review_count,
-    emailVerified: !!user.email_verified,
-    isModerator: !!user.is_moderator,
-  });
+    await getOrCreateUserMediaKey(user.id);
+    await createSession(user.id, res);
+
+    return res.json({
+      id: user.id,
+      username: user.username,
+      tokens: user.tokens,
+      rating: user.rating,
+      reviewCount: user.review_count,
+      emailVerified: !!user.email_verified,
+      isModerator: !!user.is_moderator,
+      tier: user.tier,
+      dateOfBirth: user.date_of_birth,
+      country: user.country,
+    });
+  } catch (err) {
+    console.error("Login error:", err);
+    return res.status(500).json({ error: "Failed to log in" });
+  }
 });
 
 /* verify email */
@@ -294,7 +433,9 @@ router.post("/verify-email", async (req, res) => {
 
     const row = result.rows[0];
     if (!row) {
-      return res.status(400).json({ error: "Invalid or expired verification token" });
+      return res
+        .status(400)
+        .json({ error: "Invalid or expired verification token" });
     }
 
     await pool.query("BEGIN");
@@ -353,7 +494,9 @@ router.post("/resend-verification", async (req, res) => {
     return res.json({ ok: true, alreadyVerified: false });
   } catch (err) {
     console.error("Resend verification error:", err);
-    return res.status(500).json({ error: "Failed to resend verification email" });
+    return res
+      .status(500)
+      .json({ error: "Failed to resend verification email" });
   }
 });
 
@@ -374,39 +517,47 @@ router.get("/me", async (req, res) => {
   const sid = req.cookies?.session_id;
   if (!sid) return res.status(401).json(null);
 
-  const result = await pool.query(
-    `
-    SELECT
-      u.id,
-      u.username,
-      u.tokens,
-      u.rating,
-      u.tier,
-      u.review_count,
-      u.email_verified,
-      u.is_moderator,
-      u.tier
-    FROM sessions s
-    JOIN users u ON u.id = s.user_id
-    WHERE s.id = $1 AND s.expires_at > now()
-    `,
-    [sid]
-  );
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.tokens,
+        u.rating,
+        u.review_count,
+        u.email_verified,
+        u.is_moderator,
+        u.tier,
+        u.date_of_birth,
+        u.country
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.id = $1 AND s.expires_at > now()
+      `,
+      [sid]
+    );
 
-  if (!result.rows[0]) return res.status(401).json(null);
+    if (!result.rows[0]) return res.status(401).json(null);
 
-  await getOrCreateUserMediaKey(result.rows[0].id);
+    await getOrCreateUserMediaKey(result.rows[0].id);
 
-  res.json({
-    id: result.rows[0].id,
-    username: result.rows[0].username,
-    tokens: result.rows[0].tokens,
-    rating: result.rows[0].rating,
-    reviewCount: result.rows[0].review_count,
-    isModerator: !!result.rows[0].is_moderator,
-    tier: result.rows[0].tier,
-    emailVerified: !!result.rows[0].email_verified,
-  });
+    return res.json({
+      id: result.rows[0].id,
+      username: result.rows[0].username,
+      tokens: result.rows[0].tokens,
+      rating: result.rows[0].rating,
+      reviewCount: result.rows[0].review_count,
+      isModerator: !!result.rows[0].is_moderator,
+      tier: result.rows[0].tier,
+      emailVerified: !!result.rows[0].email_verified,
+      dateOfBirth: result.rows[0].date_of_birth,
+      country: result.rows[0].country,
+    });
+  } catch (err) {
+    console.error("/me error:", err);
+    return res.status(500).json({ error: "Failed to fetch current user" });
+  }
 });
 
 export default router;
