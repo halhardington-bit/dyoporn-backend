@@ -7,6 +7,7 @@ import { fileURLToPath } from "url";
 import cookieParser from "cookie-parser";
 import "dotenv/config";
 
+
 import authRouter from "./auth.js";
 import profileRouter from "./profile.js";
 import { pool } from "./db.js";
