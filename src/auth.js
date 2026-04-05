@@ -309,9 +309,14 @@ router.post("/google/token", async (req, res) => {
   }
 
   try {
+    const audiences = [
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_ID_FOR_PYTHON,
+    ].filter(Boolean);
+
     const ticket = await googleTokenClient.verifyIdToken({
       idToken,
-      audience: process.env.GOOGLE_CLIENT_ID_FOR_PYTHON || process.env.GOOGLE_CLIENT_ID,
+      audience: audiences,
     });
 
     const payload = ticket.getPayload();
