@@ -16,7 +16,10 @@ import {
   sendPasswordResetEmail,
 } from "./mailer.js";
 
+import { OAuth2Client } from "google-auth-library";
+
 const router = express.Router();
+const googleTokenClient = new OAuth2Client();
 
 function cookieOptions() {
   const days = Number(process.env.SESSION_DAYS || 7);
@@ -62,6 +65,92 @@ function normalizeCountry(value) {
 
 function makeRandomPassword() {
   return crypto.randomBytes(32).toString("hex");
+}
+
+async function findOrCreateGoogleUserFromIdTokenPayload(payload) {
+  const provider = "google";
+  const providerUserId = String(payload.sub);
+  const email = String(payload.email || "").trim().toLowerCase() || null;
+  const emailVerified = !!payload.email_verified;
+  const displayName = String(payload.name || payload.given_name || "user").trim();
+
+  const identityResult = await pool.query(
+    `
+    SELECT u.id
+    FROM user_identities ui
+    JOIN users u ON u.id = ui.user_id
+    WHERE ui.provider = $1 AND ui.provider_user_id = $2
+    LIMIT 1
+    `,
+    [provider, providerUserId]
+  );
+
+  if (identityResult.rows[0]) {
+    return identityResult.rows[0].id;
+  }
+
+  const baseUsername =
+    displayName
+      .toLowerCase()
+      .replace(/[^a-z0-9_]/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 24) || "user";
+
+  let username = baseUsername;
+  let suffix = 1;
+
+  while (true) {
+    const existing = await pool.query(
+      `SELECT id FROM users WHERE username = $1 LIMIT 1`,
+      [username]
+    );
+    if (!existing.rows[0]) break;
+    suffix += 1;
+    username = `${baseUsername}_${suffix}`.slice(0, 32);
+  }
+
+  const randomPassword = makeRandomPassword();
+  const passwordHash = await bcrypt.hash(randomPassword, 12);
+
+  await pool.query("BEGIN");
+
+  try {
+    const userInsert = await pool.query(
+      `
+      INSERT INTO users (
+        email,
+        username,
+        password_hash,
+        email_verified
+      )
+      VALUES ($1, $2, $3, $4)
+      RETURNING id
+      `,
+      [email, username, passwordHash, emailVerified]
+    );
+
+    const userId = userInsert.rows[0].id;
+
+    await pool.query(
+      `
+      INSERT INTO user_identities (
+        user_id,
+        provider,
+        provider_user_id,
+        email_at_provider
+      )
+      VALUES ($1, $2, $3, $4)
+      `,
+      [userId, provider, providerUserId, email]
+    );
+
+    await pool.query("COMMIT");
+    return userId;
+  } catch (err) {
+    await pool.query("ROLLBACK").catch(() => {});
+    throw err;
+  }
 }
 
 async function createSession(userId, res) {
@@ -211,6 +300,71 @@ passport.use(
 // but we are still using your own cookie session system for the app.
 passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser((id, done) => done(null, { id }));
+
+router.post("/google/token", async (req, res) => {
+  const idToken = String(req.body?.idToken || "").trim();
+
+  if (!idToken) {
+    return res.status(400).json({ error: "Missing idToken" });
+  }
+
+  try {
+    const ticket = await googleTokenClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID_FOR_PYTHON || process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+
+    if (!payload?.sub) {
+      return res.status(400).json({ error: "Invalid Google token payload" });
+    }
+
+    const userId = await findOrCreateGoogleUserFromIdTokenPayload(payload);
+
+    await getOrCreateUserMediaKey(userId);
+    await createSession(userId, res);
+
+    const me = await pool.query(
+      `
+      SELECT
+        id,
+        username,
+        tokens,
+        rating,
+        review_count,
+        email_verified,
+        is_moderator,
+        tier,
+        date_of_birth,
+        country
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    const user = me.rows[0];
+
+    return res.json({
+      ok: true,
+      id: user.id,
+      username: user.username,
+      tokens: user.tokens,
+      rating: user.rating,
+      reviewCount: user.review_count,
+      emailVerified: !!user.email_verified,
+      isModerator: !!user.is_moderator,
+      tier: user.tier,
+      dateOfBirth: user.date_of_birth,
+      country: user.country,
+    });
+  } catch (err) {
+    console.error("Google token auth error:", err);
+    return res.status(401).json({ error: "Invalid Google token" });
+  }
+});
 
 router.post("/reset-password", async (req, res) => {
   const rawToken = String(req.body?.token || "").trim();
