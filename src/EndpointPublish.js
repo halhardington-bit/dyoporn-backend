@@ -282,6 +282,35 @@ function parseTags(rawTags) {
   );
 }
 
+function parseBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  const v = String(value ?? "").trim().toLowerCase();
+  if (["true", "1", "yes", "y"].includes(v)) return true;
+  if (["false", "0", "no", "n", ""].includes(v)) return false;
+  return fallback;
+}
+
+function parseCreationData(raw) {
+  if (raw == null) return {};
+
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return raw;
+  }
+
+  const text = String(raw).trim();
+  if (!text) return {};
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return { value: parsed };
+  } catch {
+    return { value: text };
+  }
+}
+
 function decryptFileAes256Gcm({ encryptedPath, outputPath, keyBuffer, ivB64, authTagB64 }) {
   if (!ivB64) throw new Error("Missing iv");
   if (!authTagB64) throw new Error("Missing authTag");
@@ -370,6 +399,9 @@ export function registerEndpointPublish(app, deps = {}) {
         const tags = parseTags(req.body?.tags);
         const iv = String(req.body?.iv || "").trim();
         const authTag = String(req.body?.authTag || "").trim();
+
+        const creationData = parseCreationData(req.body?.creationData);
+        const moderationCheck = false;
 
         if (!title) {
           cleanup();
@@ -473,9 +505,11 @@ export function registerEndpointPublish(app, deps = {}) {
             duration_text,
             duration,
             views,
-            tags
+            tags,
+            creation_data,
+            moderation_check
           )
-          VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9)
+          VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9, $10::jsonb, $11)
           RETURNING id
           `,
           [
@@ -488,6 +522,8 @@ export function registerEndpointPublish(app, deps = {}) {
             durationText,
             durationSeconds,
             tags,
+            JSON.stringify(creationData || {}),
+            moderationCheck,
           ]
         );
 
@@ -502,6 +538,8 @@ export function registerEndpointPublish(app, deps = {}) {
           thumb: thumbKey,
           duration: durationSeconds,
           durationText,
+          creationData,
+          moderationCheck,
           ms: Date.now() - startedAt,
         });
       } catch (e) {
