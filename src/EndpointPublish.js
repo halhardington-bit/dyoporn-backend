@@ -424,16 +424,10 @@ function buildModerationPayload({ primaryRenderJson, sourceMediaJsons }) {
    CRYPTO
 ============================================================ */
 
-function getRawStringMasterKek(rawMediaKey) {
-  const masterKek = Buffer.from(String(rawMediaKey || ""), "utf8");
-
-  if (masterKek.length !== 32) {
-    throw new Error(
-      `Raw string master key is ${masterKek.length} bytes, expected 32 for AES-256-GCM`
-    );
-  }
-
-  return masterKek;
+function deriveBossStyleMasterKek(rawKey) {
+  const bytes = Buffer.from(String(rawKey || ""), "utf8");
+  if (bytes.length >= 32) return bytes.subarray(0, 32);
+  return Buffer.concat([bytes, Buffer.alloc(32 - bytes.length)]);
 }
 
 async function unwrapDekBossStyle({ envelope, masterKek }) {
@@ -506,7 +500,7 @@ async function decryptFileWithEnvelopeSupport({
   encryptionEnvelope,
 }) {
   if (encryptionEnvelope) {
-    const masterKek = getRawStringMasterKek(rawMediaKey);
+    const masterKek = deriveBossStyleMasterKek(rawMediaKey);
 
     const dek = await unwrapDekBossStyle({
       envelope: encryptionEnvelope,
@@ -527,13 +521,7 @@ async function decryptFileWithEnvelopeSupport({
     return { mode: "envelope-aes-ctr" };
   }
 
-  const keyBuffer = Buffer.from(String(rawMediaKey || ""), "utf8");
-
-  if (keyBuffer.length !== 32) {
-    throw new Error(
-      `Raw string direct CTR key is ${keyBuffer.length} bytes, expected 32`
-    );
-  }
+  const keyBuffer = deriveBossStyleMasterKek(rawMediaKey);
 
   await decryptFileAesCtr({
     encryptedPath,
