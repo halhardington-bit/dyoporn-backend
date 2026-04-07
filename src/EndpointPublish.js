@@ -320,6 +320,21 @@ function parseJsonObject(raw) {
   }
 }
 
+function parseJsonArray(raw) {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw;
+
+  const text = String(raw).trim();
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function deriveBossStyleMasterKek(rawKey) {
   const bytes = Buffer.from(String(rawKey || ""), "utf8");
   if (bytes.length >= 32) return bytes.subarray(0, 32);
@@ -359,54 +374,105 @@ function safeUnlink(filePath) {
   } catch {}
 }
 
-function decryptFileAes256Gcm({ encryptedPath, outputPath, keyBuffer, ivB64, authTagB64 }) {
-  if (!ivB64) throw new Error("Missing iv");
-  if (!authTagB64) throw new Error("Missing authTag");
+/* ============================================================
+   MODERATION HELPERS
+============================================================ */
 
-  const iv = Buffer.from(String(ivB64), "base64");
-  const authTag = Buffer.from(String(authTagB64), "base64");
+function extractSourceUrlsFromEditState(root) {
+  const urls = new Set();
 
-  if (iv.length !== 12) {
-    throw new Error("IV must be 12 bytes (base64 encoded)");
+  const editState =
+    root?.dna?.edit_state ||
+    root?.edit_state ||
+    root?.creation_data?.dna?.edit_state ||
+    root?.creation_data?.edit_state ||
+    null;
+
+  if (!editState) return [];
+
+  const trackGroups = [
+    ...(Array.isArray(editState.videoTracks) ? editState.videoTracks : []),
+    ...(Array.isArray(editState.audioTracks) ? editState.audioTracks : []),
+  ];
+
+  for (const track of trackGroups) {
+    const clips = Array.isArray(track?.clips) ? track.clips : [];
+    for (const clip of clips) {
+      const sourceUrl = String(clip?.sourceUrl || "").trim();
+      if (sourceUrl) urls.add(sourceUrl);
+    }
   }
 
-  if (authTag.length !== 16) {
-    throw new Error("Auth tag must be 16 bytes (base64 encoded)");
-  }
-
-  return new Promise((resolve, reject) => {
-    const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuffer, iv);
-    decipher.setAuthTag(authTag);
-
-    const input = fs.createReadStream(encryptedPath);
-    const output = fs.createWriteStream(outputPath);
-
-    let settled = false;
-
-    const fail = (err) => {
-      if (settled) return;
-      settled = true;
-      input.destroy();
-      decipher.destroy();
-      output.destroy();
-      safeUnlink(outputPath);
-      reject(err);
-    };
-
-    const succeed = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-
-    input.on("error", fail);
-    output.on("error", fail);
-    decipher.on("error", fail);
-    output.on("close", succeed);
-
-    input.pipe(decipher).pipe(output);
-  });
+  return Array.from(urls);
 }
+
+function normalizePrimaryRenderMetadata(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  return {
+    id: raw.id ?? null,
+    name: raw.name ?? null,
+    type: raw.type ?? null,
+    image: raw.image ?? null,
+    timestamp: raw.timestamp ?? null,
+    encryption_envelope: raw.encryption_envelope ?? raw.encryptionEnvelope ?? null,
+    source_urls: extractSourceUrlsFromEditState(raw),
+  };
+}
+
+function normalizeSourceMediaJson(raw) {
+  if (!raw || typeof raw !== "object") return null;
+
+  return {
+    id: raw.id ?? null,
+    name: raw.name ?? null,
+    type: raw.type ?? null,
+    image: raw.image ?? null,
+    timestamp: raw.timestamp ?? null,
+    source_urls: extractSourceUrlsFromEditState(raw),
+    raw,
+  };
+}
+
+function buildModerationPayload({ primaryRenderJson, sourceMediaJsons }) {
+  const normalizedPrimary = normalizePrimaryRenderMetadata(primaryRenderJson);
+
+  const normalizedSources = (Array.isArray(sourceMediaJsons) ? sourceMediaJsons : [])
+    .map(normalizeSourceMediaJson)
+    .filter(Boolean);
+
+  const discoveredSourceUrls = new Set();
+
+  for (const url of normalizedPrimary?.source_urls || []) {
+    discoveredSourceUrls.add(url);
+  }
+
+  for (const item of normalizedSources) {
+    for (const url of item.source_urls || []) {
+      discoveredSourceUrls.add(url);
+    }
+    if (item.image) {
+      discoveredSourceUrls.add(item.image);
+    }
+  }
+
+  const required =
+    normalizedSources.length > 0 ||
+    (normalizedPrimary?.source_urls?.length || 0) > 0;
+
+  return {
+    required,
+    status: required ? "pending" : "not_required",
+    submitted_at: new Date().toISOString(),
+    primary_render: normalizedPrimary,
+    source_media: normalizedSources,
+    all_source_urls: Array.from(discoveredSourceUrls),
+  };
+}
+
+/* ============================================================
+   CRYPTO
+============================================================ */
 
 async function unwrapDekBossStyle({ envelope, masterKek }) {
   const encDek = envelope?.encrypted_dek;
@@ -416,6 +482,8 @@ async function unwrapDekBossStyle({ envelope, masterKek }) {
     throw new Error("Invalid encrypted_dek payload");
   }
 
+  // Layout inferred from your payload shape:
+  // [12-byte GCM IV][16-byte GCM auth tag][ciphertext]
   const gcmIv = payload.subarray(0, 12);
   const tag = payload.subarray(12, 28);
   const encryptedDek = payload.subarray(28);
@@ -428,6 +496,10 @@ async function unwrapDekBossStyle({ envelope, masterKek }) {
 
 function decryptFileAesCtr({ encryptedPath, outputPath, dekBuffer, ivB64 }) {
   const iv = Buffer.from(String(ivB64 || ""), "base64");
+
+  if (!Buffer.isBuffer(dekBuffer) || dekBuffer.length !== 32) {
+    throw new Error("DEK must be 32 bytes for AES-256-CTR");
+  }
 
   if (iv.length !== 16) {
     throw new Error("media_iv must be 16 bytes (base64 encoded)");
@@ -471,7 +543,6 @@ async function decryptFileWithEnvelopeSupport({
   outputPath,
   rawMediaKey,
   ivB64,
-  authTagB64,
   encryptionEnvelope,
 }) {
   if (encryptionEnvelope) {
@@ -492,7 +563,7 @@ async function decryptFileWithEnvelopeSupport({
           ivB64: encryptionEnvelope.media_iv,
         });
 
-        return;
+        return { mode: "envelope-aes-ctr" };
       } catch (err) {
         lastErr = err;
         safeUnlink(outputPath);
@@ -502,15 +573,17 @@ async function decryptFileWithEnvelopeSupport({
     throw lastErr || new Error("Failed to decrypt envelope-encrypted file");
   }
 
+  // Direct non-envelope CTR fallback, only if you still support it.
   const keyBuffer = mediaKeyBase64ToBuffer(rawMediaKey);
 
-  await decryptFileAes256Gcm({
+  await decryptFileAesCtr({
     encryptedPath,
     outputPath,
-    keyBuffer,
+    dekBuffer: keyBuffer,
     ivB64,
-    authTagB64,
   });
+
+  return { mode: "direct-aes-ctr" };
 }
 
 /* ============================================================
@@ -536,6 +609,7 @@ export function registerEndpointPublish(app, deps = {}) {
     }),
     limits: {
       fileSize: 1024 * 1024 * 1024,
+      files: 1,
     },
   });
 
@@ -570,15 +644,36 @@ export function registerEndpointPublish(app, deps = {}) {
         const description = String(req.body?.description || "").trim();
         const visibility = String(req.body?.visibility || "public").trim().toLowerCase();
         const tags = parseTags(req.body?.tags);
-        const iv = String(req.body?.iv || "").trim();
-        const authTag = String(req.body?.authTag || "").trim();
 
-        const creationData = parseCreationData(req.body?.creationData);
-        const moderationCheck = false;
+        // For legacy direct CTR only. Envelope path uses encryptionEnvelope.media_iv.
+        const iv = String(
+          req.body?.iv ||
+          req.body?.mediaIv ||
+          req.body?.media_iv ||
+          ""
+        ).trim();
+
+        const baseCreationData = parseCreationData(req.body?.creationData);
+
+        const primaryRenderJson =
+          parseJsonObject(req.body?.primaryRenderJson) ||
+          parseJsonObject(req.body?.renderJson) ||
+          parseJsonObject(req.body?.movieJson) ||
+          parseJsonObject(req.body?.creationJson) ||
+          null;
+
+        const sourceMediaJsons = [
+          ...parseJsonArray(req.body?.sourceMediaJsons),
+          ...parseJsonArray(req.body?.source_media_jsons),
+          ...parseJsonArray(req.body?.moderationMediaJsons),
+          ...parseJsonArray(req.body?.moderation_media_jsons),
+        ];
 
         const encryptionEnvelope =
           parseJsonObject(req.body?.encryptionEnvelope) ||
           parseJsonObject(req.body?.encryption_envelope) ||
+          primaryRenderJson?.encryption_envelope ||
+          primaryRenderJson?.encryptionEnvelope ||
           null;
 
         if (!title) {
@@ -609,10 +704,24 @@ export function registerEndpointPublish(app, deps = {}) {
           return res.status(500).json({ error: "Missing env S3_ASSETS_BUCKET" });
         }
 
-        if (!encryptionEnvelope && (!iv || !authTag)) {
+        if (encryptionEnvelope) {
+          if (!encryptionEnvelope.encrypted_dek) {
+            cleanup();
+            return res.status(400).json({
+              error: "encryptionEnvelope.encrypted_dek required",
+            });
+          }
+
+          if (!encryptionEnvelope.media_iv) {
+            cleanup();
+            return res.status(400).json({
+              error: "encryptionEnvelope.media_iv required",
+            });
+          }
+        } else if (!iv) {
           cleanup();
           return res.status(400).json({
-            error: "Either encryptionEnvelope or both iv/authTag are required",
+            error: "Either encryptionEnvelope or iv is required",
           });
         }
 
@@ -628,14 +737,26 @@ export function registerEndpointPublish(app, deps = {}) {
           `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
         );
 
-        await decryptFileWithEnvelopeSupport({
+        const decryptResult = await decryptFileWithEnvelopeSupport({
           encryptedPath: req.file.path,
           outputPath: decryptedPath,
           rawMediaKey,
           ivB64: iv,
-          authTagB64: authTag,
           encryptionEnvelope,
         });
+
+        const moderation = buildModerationPayload({
+          primaryRenderJson,
+          sourceMediaJsons,
+        });
+
+        const moderationCheck = false;
+
+        const creationData = {
+          ...(baseCreationData || {}),
+          primary_render_json: primaryRenderJson || null,
+          moderation,
+        };
 
         const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
         const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
@@ -727,7 +848,9 @@ export function registerEndpointPublish(app, deps = {}) {
           durationText,
           creationData,
           moderationCheck,
-          encryptionMode: encryptionEnvelope ? "envelope-aes-ctr" : "direct-aes-gcm",
+          moderationStatus: moderation.status,
+          moderationSources: moderation.all_source_urls.length,
+          encryptionMode: decryptResult.mode,
           ms: Date.now() - startedAt,
         });
       } catch (e) {
