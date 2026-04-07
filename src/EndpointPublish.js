@@ -139,7 +139,12 @@ export function registerEndpointPublish(app, { pool, requireAuth }) {
            DECRYPTION
         ============================ */
 
-        const userKey = await getOrCreateUserMediaKey(userId);
+        const rawKey = await getOrCreateUserMediaKey(userId);
+        const userKey = Buffer.from(rawKey, "base64");
+
+        if (userKey.length !== 32) {
+          throw new Error(`Invalid key length: ${userKey.length}`);
+        }
 
         const dek = unwrapDEK(envelope.encrypted_dek, userKey);
 
