@@ -6,7 +6,6 @@ import { spawn } from "child_process";
 import multer from "multer";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
-import { s3 } from "./aws/s3Client.js";
 import { getOrCreateUserMediaKey, mediaKeyBase64ToBuffer } from "./mediaKeys.js";
 
 /* ============================================================
@@ -282,14 +281,6 @@ function parseTags(rawTags) {
   );
 }
 
-function parseBoolean(value, fallback = false) {
-  if (typeof value === "boolean") return value;
-  const v = String(value ?? "").trim().toLowerCase();
-  if (["true", "1", "yes", "y"].includes(v)) return true;
-  if (["false", "0", "no", "n", ""].includes(v)) return false;
-  return fallback;
-}
-
 function parseCreationData(raw) {
   if (raw == null) return {};
 
@@ -311,6 +302,63 @@ function parseCreationData(raw) {
   }
 }
 
+function parseJsonObject(raw) {
+  if (raw == null) return null;
+  if (typeof raw === "object" && !Array.isArray(raw)) return raw;
+
+  const text = String(raw).trim();
+  if (!text) return null;
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function deriveBossStyleMasterKek(rawKey) {
+  const bytes = Buffer.from(String(rawKey || ""), "utf8");
+  if (bytes.length >= 32) return bytes.subarray(0, 32);
+  return Buffer.concat([bytes, Buffer.alloc(32 - bytes.length)]);
+}
+
+function getMasterKekCandidates(rawMediaKey) {
+  const out = [];
+
+  try {
+    const a = mediaKeyBase64ToBuffer(rawMediaKey);
+    if (a?.length === 32) out.push(a);
+  } catch {}
+
+  try {
+    const b = deriveBossStyleMasterKek(rawMediaKey);
+    if (b?.length === 32) out.push(b);
+  } catch {}
+
+  const unique = [];
+  const seen = new Set();
+
+  for (const buf of out) {
+    const hex = Buffer.from(buf).toString("hex");
+    if (!seen.has(hex)) {
+      seen.add(hex);
+      unique.push(buf);
+    }
+  }
+
+  return unique;
+}
+
+function safeUnlink(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {}
+}
+
 function decryptFileAes256Gcm({ encryptedPath, outputPath, keyBuffer, ivB64, authTagB64 }) {
   if (!ivB64) throw new Error("Missing iv");
   if (!authTagB64) throw new Error("Missing authTag");
@@ -326,18 +374,142 @@ function decryptFileAes256Gcm({ encryptedPath, outputPath, keyBuffer, ivB64, aut
     throw new Error("Auth tag must be 16 bytes (base64 encoded)");
   }
 
-  const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuffer, iv);
-  decipher.setAuthTag(authTag);
-
   return new Promise((resolve, reject) => {
+    const decipher = crypto.createDecipheriv("aes-256-gcm", keyBuffer, iv);
+    decipher.setAuthTag(authTag);
+
     const input = fs.createReadStream(encryptedPath);
     const output = fs.createWriteStream(outputPath);
 
-    input.on("error", reject);
-    output.on("error", reject);
-    output.on("close", resolve);
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      input.destroy();
+      decipher.destroy();
+      output.destroy();
+      safeUnlink(outputPath);
+      reject(err);
+    };
+
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    input.on("error", fail);
+    output.on("error", fail);
+    decipher.on("error", fail);
+    output.on("close", succeed);
 
     input.pipe(decipher).pipe(output);
+  });
+}
+
+async function unwrapDekBossStyle({ envelope, masterKek }) {
+  const encDek = envelope?.encrypted_dek;
+  const payload = Buffer.from(String(encDek || ""), "base64");
+
+  if (payload.length < 29) {
+    throw new Error("Invalid encrypted_dek payload");
+  }
+
+  const gcmIv = payload.subarray(0, 12);
+  const tag = payload.subarray(12, 28);
+  const encryptedDek = payload.subarray(28);
+
+  const decipher = crypto.createDecipheriv("aes-256-gcm", masterKek, gcmIv);
+  decipher.setAuthTag(tag);
+
+  return Buffer.concat([decipher.update(encryptedDek), decipher.final()]);
+}
+
+function decryptFileAesCtr({ encryptedPath, outputPath, dekBuffer, ivB64 }) {
+  const iv = Buffer.from(String(ivB64 || ""), "base64");
+
+  if (iv.length !== 16) {
+    throw new Error("media_iv must be 16 bytes (base64 encoded)");
+  }
+
+  return new Promise((resolve, reject) => {
+    const decipher = crypto.createDecipheriv("aes-256-ctr", dekBuffer, iv);
+
+    const input = fs.createReadStream(encryptedPath);
+    const output = fs.createWriteStream(outputPath);
+
+    let settled = false;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      input.destroy();
+      decipher.destroy();
+      output.destroy();
+      safeUnlink(outputPath);
+      reject(err);
+    };
+
+    const succeed = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+
+    input.on("error", fail);
+    output.on("error", fail);
+    decipher.on("error", fail);
+    output.on("close", succeed);
+
+    input.pipe(decipher).pipe(output);
+  });
+}
+
+async function decryptFileWithEnvelopeSupport({
+  encryptedPath,
+  outputPath,
+  rawMediaKey,
+  ivB64,
+  authTagB64,
+  encryptionEnvelope,
+}) {
+  if (encryptionEnvelope) {
+    const candidates = getMasterKekCandidates(rawMediaKey);
+    let lastErr = null;
+
+    for (const masterKek of candidates) {
+      try {
+        const dek = await unwrapDekBossStyle({
+          envelope: encryptionEnvelope,
+          masterKek,
+        });
+
+        await decryptFileAesCtr({
+          encryptedPath,
+          outputPath,
+          dekBuffer: dek,
+          ivB64: encryptionEnvelope.media_iv,
+        });
+
+        return;
+      } catch (err) {
+        lastErr = err;
+        safeUnlink(outputPath);
+      }
+    }
+
+    throw lastErr || new Error("Failed to decrypt envelope-encrypted file");
+  }
+
+  const keyBuffer = mediaKeyBase64ToBuffer(rawMediaKey);
+
+  await decryptFileAes256Gcm({
+    encryptedPath,
+    outputPath,
+    keyBuffer,
+    ivB64,
+    authTagB64,
   });
 }
 
@@ -379,6 +551,7 @@ export function registerEndpointPublish(app, deps = {}) {
       const decryptedDir = path.join(tmpRoot, "decrypted");
       const outDir = path.join(tmpRoot, "out");
       const hlsDir = path.join(outDir, "hls");
+
       fs.mkdirSync(decryptedDir, { recursive: true });
       fs.mkdirSync(outDir, { recursive: true });
       fs.mkdirSync(hlsDir, { recursive: true });
@@ -403,6 +576,11 @@ export function registerEndpointPublish(app, deps = {}) {
         const creationData = parseCreationData(req.body?.creationData);
         const moderationCheck = false;
 
+        const encryptionEnvelope =
+          parseJsonObject(req.body?.encryptionEnvelope) ||
+          parseJsonObject(req.body?.encryption_envelope) ||
+          null;
+
         if (!title) {
           cleanup();
           return res.status(400).json({ error: "Title required" });
@@ -416,7 +594,9 @@ export function registerEndpointPublish(app, deps = {}) {
         const allowedVis = new Set(["public", "private", "unlisted"]);
         if (!allowedVis.has(visibility)) {
           cleanup();
-          return res.status(400).json({ error: "Visibility must be public, private, or unlisted" });
+          return res.status(400).json({
+            error: "Visibility must be public, private, or unlisted",
+          });
         }
 
         if (!process.env.S3_UPLOADS_BUCKET) {
@@ -429,8 +609,14 @@ export function registerEndpointPublish(app, deps = {}) {
           return res.status(500).json({ error: "Missing env S3_ASSETS_BUCKET" });
         }
 
-        const mediaKey = await getOrCreateUserMediaKey(userId);
-        const keyBuffer = mediaKeyBase64ToBuffer(mediaKey);
+        if (!encryptionEnvelope && (!iv || !authTag)) {
+          cleanup();
+          return res.status(400).json({
+            error: "Either encryptionEnvelope or both iv/authTag are required",
+          });
+        }
+
+        const rawMediaKey = await getOrCreateUserMediaKey(userId);
 
         const originalExt =
           path.extname(req.body?.originalFilename || "").toLowerCase() ||
@@ -442,12 +628,13 @@ export function registerEndpointPublish(app, deps = {}) {
           `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
         );
 
-        await decryptFileAes256Gcm({
+        await decryptFileWithEnvelopeSupport({
           encryptedPath: req.file.path,
           outputPath: decryptedPath,
-          keyBuffer,
+          rawMediaKey,
           ivB64: iv,
           authTagB64: authTag,
+          encryptionEnvelope,
         });
 
         const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
@@ -540,6 +727,7 @@ export function registerEndpointPublish(app, deps = {}) {
           durationText,
           creationData,
           moderationCheck,
+          encryptionMode: encryptionEnvelope ? "envelope-aes-ctr" : "direct-aes-gcm",
           ms: Date.now() - startedAt,
         });
       } catch (e) {
