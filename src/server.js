@@ -80,6 +80,33 @@ function makeAssetsS3Client() {
   });
 }
 
+async function retry(fn, { attempts = 2, delayMs = 500 } = {}) {
+  let lastErr;
+
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+
+      const retryable =
+        err?.message?.includes("socket hang up") ||
+        err?.code === "ECONNRESET" ||
+        err?.code === "ETIMEDOUT";
+
+      if (!retryable || i === attempts - 1) {
+        throw err;
+      }
+
+      console.warn(`[retry] attempt ${i + 1} failed, retrying...`, err.message);
+
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+  }
+
+  throw lastErr;
+}
+
 async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
   const Body = fs.createReadStream(filePath);
 
@@ -3047,7 +3074,14 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
     log("S3 HLS upload start", { bucket, keyPrefix: hlsKeyPrefix });
 
     const tS3 = Date.now();
-    await uploadDirToS3({ bucket, dirPath: hlsOutDir, keyPrefix: hlsKeyPrefix });
+    await retry(() =>
+      uploadDirToS3({
+        uploadFileToS3,
+        bucket: uploadsBucket,
+        localDir: hlsDir,
+        keyPrefix: hlsKeyPrefix,
+      })
+    );
     log("S3 HLS upload ok", { ms: Date.now() - tS3 });
 
     storedFilename = `${hlsKeyPrefix}/master.m3u8`;
@@ -3088,13 +3122,15 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
         key: thumbKey,
       });
 
-      await uploadFileToAssetsBucket({
-        assetsS3,
-        bucket: assetsBucket,
-        key: thumbKey,
-        filePath: thumbPath,
-        contentType: "image/jpeg",
-      });
+      await retry(() =>
+        uploadFileToAssetsBucket({
+          assetsS3,
+          bucket: assetsBucket,
+          key: thumbKey,
+          filePath: thumbPath,
+          contentType: "image/jpeg",
+        })
+      );
 
       storedThumb = thumbKey;
       log("S3 thumb upload ok", { key: storedThumb });
