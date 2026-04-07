@@ -9,25 +9,37 @@ import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 
 /* ============================================================
-   UTIL
+   SMALL UTILS
 ============================================================ */
 
-function runCmd(cmd, args, { cwd } = {}) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(cmd, args, { windowsHide: true, cwd });
+function nowMs() {
+  return Date.now();
+}
 
-    let out = "";
-    let err = "";
+function elapsed(start) {
+  return Date.now() - start;
+}
 
-    p.stdout.on("data", (d) => (out += d.toString()));
-    p.stderr.on("data", (d) => (err += d.toString()));
+function logStage(reqId, label, extra) {
+  if (extra !== undefined) {
+    console.log(`[endpoint-publish ${reqId}] ${label}`, extra);
+  } else {
+    console.log(`[endpoint-publish ${reqId}] ${label}`);
+  }
+}
 
-    p.on("error", reject);
-    p.on("close", (code) => {
-      if (code === 0) return resolve({ out, err });
-      reject(new Error(err || `${cmd} exited with code ${code}`));
-    });
-  });
+function safeUnlink(filePath) {
+  try {
+    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  } catch {}
+}
+
+function safeRm(dirPath) {
+  try {
+    if (dirPath && fs.existsSync(dirPath)) {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+    }
+  } catch {}
 }
 
 function clamp(n, min, max) {
@@ -43,39 +55,70 @@ function formatDurationText(totalSeconds) {
   if (hours > 0) {
     return `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
   }
-
   return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
 
-function makeAssetsS3Client() {
-  const region =
-    process.env.S3_ASSETS_REGION ||
-    process.env.AWS_REGION ||
-    process.env.AWS_DEFAULT_REGION;
+function parseCreationData(raw) {
+  if (raw == null) return {};
+  if (typeof raw === "object" && !Array.isArray(raw)) return raw;
 
-  if (!region) {
-    throw new Error("Missing env S3_ASSETS_REGION (or AWS_REGION)");
+  const text = String(raw).trim();
+  if (!text) return {};
+
+  try {
+    const parsed = JSON.parse(text);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed;
+    }
+    return {};
+  } catch {
+    return {};
   }
-
-  const endpoint = process.env.S3_ASSETS_ENDPOINT || undefined;
-
-  return new S3Client({
-    region,
-    ...(endpoint ? { endpoint } : {}),
-  });
 }
 
-async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
-  const Body = fs.createReadStream(filePath);
+function parseJsonArray(raw) {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw;
 
-  await assetsS3.send(
-    new PutObjectCommand({
-      Bucket: bucket,
-      Key: key,
-      Body,
-      ContentType: contentType,
-      CacheControl: "public, max-age=31536000, immutable",
-    })
+  const text = String(raw).trim();
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function parseTags(rawTags) {
+  if (Array.isArray(rawTags)) {
+    return Array.from(
+      new Set(
+        rawTags
+          .map((t) => String(t || "").trim().toLowerCase())
+          .filter(Boolean)
+          .slice(0, 30)
+      )
+    );
+  }
+
+  const text = String(rawTags || "").trim();
+  if (!text) return [];
+
+  try {
+    const parsed = JSON.parse(text);
+    if (Array.isArray(parsed)) return parseTags(parsed);
+  } catch {}
+
+  return Array.from(
+    new Set(
+      text
+        .split(",")
+        .map((t) => String(t || "").trim().toLowerCase())
+        .filter(Boolean)
+        .slice(0, 30)
+    )
   );
 }
 
@@ -108,21 +151,26 @@ function listFilesRecursive(dir) {
   return out;
 }
 
-async function uploadDirToS3({ uploadFileToS3, bucket, localDir, keyPrefix }) {
-  const files = listFilesRecursive(localDir);
+/* ============================================================
+   PROCESS HELPERS
+============================================================ */
 
-  for (const filePath of files) {
-    const rel = path.relative(localDir, filePath).split(path.sep).join("/");
-    const key = `${keyPrefix.replace(/\/+$/g, "")}/${rel}`;
-    const ext = path.extname(filePath);
+function runCmd(cmd, args, { cwd } = {}) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(cmd, args, { windowsHide: true, cwd });
 
-    await uploadFileToS3({
-      bucket,
-      key,
-      filePath,
-      contentType: contentTypeForExt(ext),
+    let out = "";
+    let err = "";
+
+    p.stdout.on("data", (d) => (out += d.toString()));
+    p.stderr.on("data", (d) => (err += d.toString()));
+
+    p.on("error", reject);
+    p.on("close", (code) => {
+      if (code === 0) return resolve({ out, err });
+      reject(new Error(err || `${cmd} exited with code ${code}`));
     });
-  }
+  });
 }
 
 async function getVideoDurationSeconds(videoPath) {
@@ -158,26 +206,32 @@ async function generateThumbnailAtSecond(videoPath, thumbPath, seconds) {
     "-frames:v",
     "1",
     "-vf",
-    "scale=1280:-2",
+    "scale=640:-2",
     "-q:v",
-    "2",
+    "3",
     thumbPath,
   ]);
 }
 
-async function generateThumbnailHalfwayWithFallback(videoPath, thumbPath) {
-  const dur = await getVideoDurationSeconds(videoPath);
-
+async function generateThumbnailWithDuration(videoPath, thumbPath, durationSeconds) {
   let candidates = [];
-  if (dur && dur > 0) {
-    const half = clamp(Math.floor(dur * 0.5), 1, Math.max(1, Math.floor(dur - 1)));
-    candidates = [half, 30, 10, 3, 1]
-      .map((t) => clamp(Number(t), 0, Math.max(0, Math.floor(dur - 0.25))))
+
+  if (durationSeconds && durationSeconds > 0) {
+    const half = clamp(
+      Math.floor(durationSeconds * 0.5),
+      1,
+      Math.max(1, Math.floor(durationSeconds - 1))
+    );
+
+    candidates = [half, 3, 1, 10, 30]
+      .map((t) =>
+        clamp(Number(t), 0, Math.max(0, Math.floor(durationSeconds - 0.25)))
+      )
       .filter((t) => Number.isFinite(t) && t >= 0);
 
     candidates = Array.from(new Set(candidates));
   } else {
-    candidates = [30, 10, 3, 1];
+    candidates = [3, 1, 10, 30];
   }
 
   let lastErr = null;
@@ -185,12 +239,10 @@ async function generateThumbnailHalfwayWithFallback(videoPath, thumbPath) {
   for (const t of candidates) {
     try {
       await generateThumbnailAtSecond(videoPath, thumbPath, t);
-      return { ok: true, usedSecond: t, duration: dur };
+      return t;
     } catch (e) {
       lastErr = e;
-      try {
-        if (fs.existsSync(thumbPath)) fs.unlinkSync(thumbPath);
-      } catch {}
+      safeUnlink(thumbPath);
     }
   }
 
@@ -205,6 +257,8 @@ async function generateHlsVOD(inputPath, outDir) {
     "-hide_banner",
     "-loglevel",
     "error",
+    "-threads",
+    "0",
     "-i",
     inputPath,
     "-vf",
@@ -212,21 +266,11 @@ async function generateHlsVOD(inputPath, outDir) {
     "-c:v",
     "libx264",
     "-preset",
-    "veryfast",
+    "superfast",
     "-crf",
-    "22",
+    "23",
     "-pix_fmt",
     "yuv420p",
-    "-profile:v",
-    "main",
-    "-level",
-    "4.0",
-    "-colorspace",
-    "bt709",
-    "-color_primaries",
-    "bt709",
-    "-color_trc",
-    "bt709",
     "-c:a",
     "aac",
     "-b:a",
@@ -236,7 +280,7 @@ async function generateHlsVOD(inputPath, outDir) {
     "-f",
     "hls",
     "-hls_time",
-    "6",
+    "10",
     "-hls_playlist_type",
     "vod",
     "-hls_flags",
@@ -251,77 +295,102 @@ async function generateHlsVOD(inputPath, outDir) {
   await runCmd("ffmpeg", args);
 }
 
-function parseTags(rawTags) {
-  if (Array.isArray(rawTags)) {
-    return Array.from(
-      new Set(
-        rawTags
-          .map((t) => String(t || "").trim().toLowerCase())
-          .filter(Boolean)
-          .slice(0, 30)
-      )
-    );
+/* ============================================================
+   S3 HELPERS
+============================================================ */
+
+function makeAssetsS3Client() {
+  const region =
+    process.env.S3_ASSETS_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_DEFAULT_REGION;
+
+  if (!region) {
+    throw new Error("Missing env S3_ASSETS_REGION (or AWS_REGION)");
   }
 
-  const text = String(rawTags || "").trim();
-  if (!text) return [];
+  const endpoint = process.env.S3_ASSETS_ENDPOINT || undefined;
 
-  try {
-    const parsed = JSON.parse(text);
-    if (Array.isArray(parsed)) return parseTags(parsed);
-  } catch {}
+  return new S3Client({
+    region,
+    ...(endpoint ? { endpoint } : {}),
+  });
+}
 
-  return Array.from(
-    new Set(
-      text
-        .split(",")
-        .map((t) => String(t || "").trim().toLowerCase())
-        .filter(Boolean)
-        .slice(0, 30)
-    )
+async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
+  const Body = fs.createReadStream(filePath);
+
+  await assetsS3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body,
+      ContentType: contentType,
+      CacheControl: "public, max-age=31536000, immutable",
+    })
   );
 }
 
-function parseCreationData(raw) {
-  if (raw == null) return {};
+async function retry(fn, { attempts = 2, delayMs = 500 } = {}) {
+  let lastErr;
 
-  if (typeof raw === "object" && !Array.isArray(raw)) {
-    return raw;
-  }
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
 
-  const text = String(raw).trim();
-  if (!text) return {};
+      const retryable =
+        err?.message?.includes("socket hang up") ||
+        err?.code === "ECONNRESET" ||
+        err?.code === "ETIMEDOUT";
 
-  try {
-    const parsed = JSON.parse(text);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      return parsed;
+      if (!retryable || i === attempts - 1) throw err;
+
+      await new Promise((r) => setTimeout(r, delayMs));
     }
-    return { value: parsed };
-  } catch {
-    return { value: text };
   }
+
+  throw lastErr;
 }
 
-function parseJsonArray(raw) {
-  if (raw == null) return [];
-  if (Array.isArray(raw)) return raw;
+async function uploadDirToS3Concurrent({
+  uploadFileToS3,
+  bucket,
+  localDir,
+  keyPrefix,
+  concurrency = 6,
+}) {
+  const files = listFilesRecursive(localDir);
+  let index = 0;
 
-  const text = String(raw).trim();
-  if (!text) return [];
+  async function worker() {
+    while (true) {
+      const current = index++;
+      if (current >= files.length) return;
 
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+      const filePath = files[current];
+      const rel = path.relative(localDir, filePath).split(path.sep).join("/");
+      const key = `${keyPrefix.replace(/\/+$/g, "")}/${rel}`;
+      const ext = path.extname(filePath);
+
+      await retry(() =>
+        uploadFileToS3({
+          bucket,
+          key,
+          filePath,
+          contentType: contentTypeForExt(ext),
+        })
+      );
+    }
   }
-}
 
-function safeUnlink(filePath) {
-  try {
-    if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch {}
+  const workers = Array.from(
+    { length: Math.min(concurrency, Math.max(files.length, 1)) },
+    () => worker()
+  );
+
+  await Promise.all(workers);
 }
 
 /* ============================================================
@@ -401,9 +470,7 @@ function buildModerationPayload({ primaryRenderJson, sourceMediaJsons }) {
     for (const url of item.source_urls || []) {
       discoveredSourceUrls.add(url);
     }
-    if (item.image) {
-      discoveredSourceUrls.add(item.image);
-    }
+    if (item.image) discoveredSourceUrls.add(item.image);
   }
 
   const required =
@@ -461,7 +528,6 @@ function decryptFileAesCtr({ encryptedPath, outputPath, dekBuffer, ivB64 }) {
 
   return new Promise((resolve, reject) => {
     const decipher = crypto.createDecipheriv("aes-256-ctr", dekBuffer, iv);
-
     const input = fs.createReadStream(encryptedPath);
     const output = fs.createWriteStream(outputPath);
 
@@ -566,7 +632,8 @@ export function registerEndpointPublish(app, deps = {}) {
     requireAuth,
     upload.single("media"),
     async (req, res) => {
-      const startedAt = Date.now();
+      const startedAt = nowMs();
+      const reqId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const userId = Number(req.user.id);
 
       const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-endpoint-publish-"));
@@ -579,15 +646,13 @@ export function registerEndpointPublish(app, deps = {}) {
       fs.mkdirSync(hlsDir, { recursive: true });
 
       const cleanup = () => {
-        try {
-          fs.rmSync(tmpRoot, { recursive: true, force: true });
-        } catch {}
-        try {
-          if (req.file?.path && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        } catch {}
+        safeRm(tmpRoot);
+        safeUnlink(req.file?.path);
       };
 
       try {
+        logStage(reqId, "start");
+
         const title = String(req.body?.title || "").trim();
         const description = String(req.body?.description || "").trim();
         const visibility = String(req.body?.visibility || "public").trim().toLowerCase();
@@ -664,8 +729,6 @@ export function registerEndpointPublish(app, deps = {}) {
           });
         }
 
-        const rawMediaKey = await getOrCreateUserMediaKey(userId);
-
         const originalExt =
           path.extname(req.body?.originalFilename || "").toLowerCase() ||
           path.extname(req.file.originalname || "").toLowerCase() ||
@@ -676,6 +739,11 @@ export function registerEndpointPublish(app, deps = {}) {
           `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
         );
 
+        const tKey = nowMs();
+        const rawMediaKey = await getOrCreateUserMediaKey(userId);
+        logStage(reqId, "media key loaded", { ms: elapsed(tKey) });
+
+        const tDecrypt = nowMs();
         const decryptResult = await decryptFileWithEnvelopeSupport({
           encryptedPath: req.file.path,
           outputPath: decryptedPath,
@@ -683,6 +751,7 @@ export function registerEndpointPublish(app, deps = {}) {
           ivB64: iv,
           encryptionEnvelope,
         });
+        logStage(reqId, "decrypted", { ms: elapsed(tDecrypt), mode: decryptResult.mode });
 
         const moderation = buildModerationPayload({
           primaryRenderJson,
@@ -696,15 +765,21 @@ export function registerEndpointPublish(app, deps = {}) {
           moderation,
         };
 
+        const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
+        const thumbPath = path.join(outDir, thumbName);
+
+        const tPrep = nowMs();
         const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
         const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
         const durationText = formatDurationText(durationSeconds);
 
-        const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
-        const thumbPath = path.join(outDir, thumbName);
+        await generateThumbnailWithDuration(decryptedPath, thumbPath, durationSeconds);
+        logStage(reqId, "duration + thumb ready", {
+          ms: elapsed(tPrep),
+          durationSeconds,
+        });
 
-        await generateThumbnailHalfwayWithFallback(decryptedPath, thumbPath);
-
+        const tHls = nowMs();
         const hlsBase = `endpoint-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
         await generateHlsVOD(decryptedPath, hlsDir);
 
@@ -712,30 +787,39 @@ export function registerEndpointPublish(app, deps = {}) {
         if (!fs.existsSync(localMaster)) {
           throw new Error("HLS export failed: master.m3u8 not created");
         }
+        logStage(reqId, "hls generated", { ms: elapsed(tHls) });
 
         const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
         const assetsBucket = process.env.S3_ASSETS_BUCKET;
-
         const hlsKeyPrefix = `hls/${userId}/${hlsBase}`;
-        await uploadDirToS3({
-          uploadFileToS3,
-          bucket: uploadsBucket,
-          localDir: hlsDir,
-          keyPrefix: hlsKeyPrefix,
-        });
+        const thumbKey = `thumbs/${userId}/${thumbName}`;
 
         const assetsS3 = makeAssetsS3Client();
-        const thumbKey = `thumbs/${userId}/${thumbName}`;
-        await uploadFileToAssetsBucket({
-          assetsS3,
-          bucket: assetsBucket,
-          key: thumbKey,
-          filePath: thumbPath,
-          contentType: "image/jpeg",
-        });
+
+        const tUpload = nowMs();
+        await Promise.all([
+          uploadDirToS3Concurrent({
+            uploadFileToS3,
+            bucket: uploadsBucket,
+            localDir: hlsDir,
+            keyPrefix: hlsKeyPrefix,
+            concurrency: 6,
+          }),
+          retry(() =>
+            uploadFileToAssetsBucket({
+              assetsS3,
+              bucket: assetsBucket,
+              key: thumbKey,
+              filePath: thumbPath,
+              contentType: "image/jpeg",
+            })
+          ),
+        ]);
+        logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
 
         const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
 
+        const tDb = nowMs();
         const ins = await pool.query(
           `
           INSERT INTO videos (
@@ -772,10 +856,12 @@ export function registerEndpointPublish(app, deps = {}) {
             moderationCheck,
           ]
         );
+        logStage(reqId, "db insert complete", { ms: elapsed(tDb) });
 
         const newVideoId = ins.rows[0].id;
 
         cleanup();
+        logStage(reqId, "done", { totalMs: elapsed(startedAt) });
 
         return res.json({
           ok: true,
@@ -789,10 +875,10 @@ export function registerEndpointPublish(app, deps = {}) {
           moderationStatus: moderation.status,
           moderationSources: moderation.all_source_urls.length,
           encryptionMode: decryptResult.mode,
-          ms: Date.now() - startedAt,
+          ms: elapsed(startedAt),
         });
       } catch (e) {
-        console.error("POST /api/endpoint/publish error:", e);
+        console.error(`[endpoint-publish ${reqId}] error:`, e);
         cleanup();
         return res.status(500).json({
           ok: false,
