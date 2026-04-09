@@ -206,9 +206,9 @@ async function generateThumbnailAtSecond(videoPath, thumbPath, seconds) {
     "-frames:v",
     "1",
     "-vf",
-    "scale=640:-2",
+    "scale=480:-2",
     "-q:v",
-    "3",
+    "4",
     thumbPath,
   ]);
 }
@@ -262,13 +262,13 @@ async function generateHlsVOD(inputPath, outDir) {
     "-i",
     inputPath,
     "-vf",
-    "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+    "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease,format=yuv420p",
     "-c:v",
     "libx264",
     "-preset",
     "superfast",
     "-crf",
-    "23",
+    "24",
     "-pix_fmt",
     "yuv420p",
     "-c:a",
@@ -346,7 +346,6 @@ async function retry(fn, { attempts = 2, delayMs = 500 } = {}) {
         err?.code === "ETIMEDOUT";
 
       if (!retryable || i === attempts - 1) throw err;
-
       await new Promise((r) => setTimeout(r, delayMs));
     }
   }
@@ -359,7 +358,7 @@ async function uploadDirToS3Concurrent({
   bucket,
   localDir,
   keyPrefix,
-  concurrency = 6,
+  concurrency = 8,
 }) {
   const files = listFilesRecursive(localDir);
   let index = 0;
@@ -385,12 +384,8 @@ async function uploadDirToS3Concurrent({
     }
   }
 
-  const workers = Array.from(
-    { length: Math.min(concurrency, Math.max(files.length, 1)) },
-    () => worker()
-  );
-
-  await Promise.all(workers);
+  const workerCount = Math.min(concurrency, Math.max(files.length, 1));
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
 }
 
 /* ============================================================
@@ -600,7 +595,339 @@ async function decryptFileWithEnvelopeSupport({
 }
 
 /* ============================================================
-   MAIN ROUTE
+   JOB WORKER
+============================================================ */
+
+let queueStarted = false;
+const queuedJobIds = new Set();
+let activeWorkers = 0;
+const MAX_WORKERS = 1;
+
+async function updateJob(pool, jobId, patch = {}) {
+  const sets = [];
+  const values = [];
+  let i = 1;
+
+  for (const [k, v] of Object.entries(patch)) {
+    sets.push(`${k} = $${i++}`);
+    values.push(v);
+  }
+
+  if (!sets.length) return;
+
+  values.push(jobId);
+
+  await pool.query(
+    `UPDATE publish_jobs SET ${sets.join(", ")} WHERE id = $${i}`,
+    values
+  );
+}
+
+async function fetchJob(pool, jobId) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM publish_jobs
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [jobId]
+  );
+
+  return result.rows[0] || null;
+}
+
+async function processPublishJob({ pool, uploadFileToS3, job }) {
+  const reqId = `job-${job.id}-${crypto.randomBytes(4).toString("hex")}`;
+  const startedAt = nowMs();
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-endpoint-job-"));
+  const decryptedDir = path.join(tmpRoot, "decrypted");
+  const outDir = path.join(tmpRoot, "out");
+  const hlsDir = path.join(outDir, "hls");
+
+  fs.mkdirSync(decryptedDir, { recursive: true });
+  fs.mkdirSync(outDir, { recursive: true });
+  fs.mkdirSync(hlsDir, { recursive: true });
+
+  try {
+    logStage(reqId, "job start", { jobId: job.id });
+
+    await updateJob(pool, job.id, {
+      status: "processing",
+      progress_stage: "starting",
+      progress_pct: 5,
+      started_at: new Date(),
+      error_message: null,
+    });
+
+    const creationData = job.creation_data || {};
+    const primaryRenderJson = creationData;
+    const sourceMediaJsons = [];
+    const encryptionEnvelope =
+      primaryRenderJson?.encryption_envelope ||
+      primaryRenderJson?.encryptionEnvelope ||
+      null;
+
+    if (!encryptionEnvelope?.encrypted_dek || !encryptionEnvelope?.media_iv) {
+      throw new Error("creation_data.encryption_envelope is invalid");
+    }
+
+    await updateJob(pool, job.id, {
+      progress_stage: "decrypting",
+      progress_pct: 15,
+    });
+
+    const originalExt =
+      path.extname(job.original_filename || "").toLowerCase() ||
+      path.extname(job.upload_path || "").toLowerCase() ||
+      ".mp4";
+
+    const decryptedPath = path.join(
+      decryptedDir,
+      `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
+    );
+
+    const rawMediaKey = await getOrCreateUserMediaKey(job.user_id);
+
+    const tDecrypt = nowMs();
+    const decryptResult = await decryptFileWithEnvelopeSupport({
+      encryptedPath: job.upload_path,
+      outputPath: decryptedPath,
+      rawMediaKey,
+      ivB64: "",
+      encryptionEnvelope,
+    });
+    logStage(reqId, "decrypted", { ms: elapsed(tDecrypt), mode: decryptResult.mode });
+
+    await updateJob(pool, job.id, {
+      progress_stage: "probing",
+      progress_pct: 30,
+    });
+
+    const moderation = buildModerationPayload({
+      primaryRenderJson,
+      sourceMediaJsons,
+    });
+
+    const finalCreationData = {
+      ...creationData,
+      moderation,
+    };
+
+    const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
+    const thumbPath = path.join(outDir, thumbName);
+
+    const tProbe = nowMs();
+    const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
+    const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
+    const durationText = formatDurationText(durationSeconds);
+    logStage(reqId, "duration ready", {
+      ms: elapsed(tProbe),
+      durationSeconds,
+    });
+
+    await updateJob(pool, job.id, {
+      progress_stage: "transcoding",
+      progress_pct: 45,
+    });
+
+    const tThumb = nowMs();
+    const tHls = nowMs();
+    const hlsBase = `endpoint-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
+
+    await Promise.all([
+      generateThumbnailWithDuration(decryptedPath, thumbPath, durationSeconds),
+      generateHlsVOD(decryptedPath, hlsDir),
+    ]);
+
+    logStage(reqId, "thumb generated", { ms: elapsed(tThumb) });
+    logStage(reqId, "hls generated", { ms: elapsed(tHls) });
+
+    const localMaster = path.join(hlsDir, "master.m3u8");
+    if (!fs.existsSync(localMaster)) {
+      throw new Error("HLS export failed: master.m3u8 not created");
+    }
+
+    await updateJob(pool, job.id, {
+      progress_stage: "uploading_assets",
+      progress_pct: 75,
+    });
+
+    const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
+    const assetsBucket = process.env.S3_ASSETS_BUCKET;
+    const hlsKeyPrefix = `hls/${job.user_id}/${hlsBase}`;
+    const thumbKey = `thumbs/${job.user_id}/${thumbName}`;
+    const assetsS3 = makeAssetsS3Client();
+
+    const tUpload = nowMs();
+    await Promise.all([
+      uploadDirToS3Concurrent({
+        uploadFileToS3,
+        bucket: uploadsBucket,
+        localDir: hlsDir,
+        keyPrefix: hlsKeyPrefix,
+        concurrency: 8,
+      }),
+      retry(() =>
+        uploadFileToAssetsBucket({
+          assetsS3,
+          bucket: assetsBucket,
+          key: thumbKey,
+          filePath: thumbPath,
+          contentType: "image/jpeg",
+        })
+      ),
+    ]);
+    logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
+
+    await updateJob(pool, job.id, {
+      progress_stage: "finalizing",
+      progress_pct: 90,
+    });
+
+    const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
+
+    const ins = await pool.query(
+      `
+      INSERT INTO videos (
+        user_id,
+        title,
+        description,
+        category,
+        visibility,
+        media_type,
+        asset_scope,
+        filename,
+        thumb,
+        duration_text,
+        duration,
+        views,
+        tags,
+        creation_data,
+        moderation_check
+      )
+      VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9, $10::jsonb, false)
+      RETURNING id
+      `,
+      [
+        job.user_id,
+        job.title,
+        job.description,
+        job.visibility,
+        hlsMasterKey,
+        thumbKey,
+        durationText,
+        durationSeconds,
+        job.tags || [],
+        JSON.stringify(finalCreationData || {}),
+      ]
+    );
+
+    const videoId = ins.rows[0].id;
+
+    await updateJob(pool, job.id, {
+      status: "complete",
+      progress_stage: "complete",
+      progress_pct: 100,
+      finished_at: new Date(),
+      video_id: videoId,
+      error_message: null,
+    });
+
+    safeUnlink(job.upload_path);
+    safeRm(tmpRoot);
+
+    logStage(reqId, "job done", {
+      totalMs: elapsed(startedAt),
+      videoId,
+    });
+  } catch (e) {
+    console.error(`[endpoint-publish worker ${job.id}] error:`, e);
+
+    await updateJob(pool, job.id, {
+      status: "failed",
+      progress_stage: "failed",
+      finished_at: new Date(),
+      error_message: e?.message || "Publish failed",
+    }).catch(() => {});
+
+    safeRm(tmpRoot);
+  }
+}
+
+async function pumpQueue({ pool, uploadFileToS3 }) {
+  if (activeWorkers >= MAX_WORKERS) return;
+
+  const available = MAX_WORKERS - activeWorkers;
+  const ids = Array.from(queuedJobIds).slice(0, available);
+
+  for (const jobId of ids) {
+    queuedJobIds.delete(jobId);
+    activeWorkers += 1;
+
+    (async () => {
+      try {
+        const job = await fetchJob(pool, jobId);
+        if (!job) return;
+        if (job.status === "complete") return;
+
+        await processPublishJob({ pool, uploadFileToS3, job });
+      } finally {
+        activeWorkers -= 1;
+        setImmediate(() => {
+          pumpQueue({ pool, uploadFileToS3 }).catch((err) => {
+            console.error("[endpoint-publish queue pump] error:", err);
+          });
+        });
+      }
+    })();
+  }
+}
+
+async function enqueueJob({ pool, uploadFileToS3, jobId }) {
+  queuedJobIds.add(jobId);
+  setImmediate(() => {
+    pumpQueue({ pool, uploadFileToS3 }).catch((err) => {
+      console.error("[endpoint-publish enqueue] error:", err);
+    });
+  });
+}
+
+function startRecoveryLoop({ pool, uploadFileToS3 }) {
+  if (queueStarted) return;
+  queueStarted = true;
+
+  const recover = async () => {
+    try {
+      const result = await pool.query(
+        `
+        SELECT id
+        FROM publish_jobs
+        WHERE status IN ('queued', 'processing')
+        ORDER BY id ASC
+        LIMIT 20
+        `
+      );
+
+      for (const row of result.rows) {
+        queuedJobIds.add(Number(row.id));
+      }
+
+      await pumpQueue({ pool, uploadFileToS3 });
+    } catch (e) {
+      console.error("[endpoint-publish recovery] error:", e);
+    }
+  };
+
+  recover().catch(() => {});
+  setInterval(() => {
+    recover().catch(() => {});
+  }, 5000);
+}
+
+/* ============================================================
+   MAIN ROUTES
 ============================================================ */
 
 export function registerEndpointPublish(app, deps = {}) {
@@ -609,6 +936,8 @@ export function registerEndpointPublish(app, deps = {}) {
   if (!pool) throw new Error("registerEndpointPublish: missing pool");
   if (!requireAuth) throw new Error("registerEndpointPublish: missing requireAuth");
   if (!uploadFileToS3) throw new Error("registerEndpointPublish: missing uploadFileToS3");
+
+  startRecoveryLoop({ pool, uploadFileToS3 });
 
   const TMP_UPLOAD_DIR = path.join(os.tmpdir(), "mytube-endpoint-publish-uploads");
   fs.mkdirSync(TMP_UPLOAD_DIR, { recursive: true });
@@ -632,258 +961,147 @@ export function registerEndpointPublish(app, deps = {}) {
     requireAuth,
     upload.single("media"),
     async (req, res) => {
-      const startedAt = nowMs();
       const reqId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const userId = Number(req.user.id);
 
-      const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-endpoint-publish-"));
-      const decryptedDir = path.join(tmpRoot, "decrypted");
-      const outDir = path.join(tmpRoot, "out");
-      const hlsDir = path.join(outDir, "hls");
-
-      fs.mkdirSync(decryptedDir, { recursive: true });
-      fs.mkdirSync(outDir, { recursive: true });
-      fs.mkdirSync(hlsDir, { recursive: true });
-
-      const cleanup = () => {
-        safeRm(tmpRoot);
-        safeUnlink(req.file?.path);
-      };
-
       try {
-        logStage(reqId, "start");
+        logStage(reqId, "request start");
 
         const title = String(req.body?.title || "").trim();
         const description = String(req.body?.description || "").trim();
         const visibility = String(req.body?.visibility || "public").trim().toLowerCase();
         const tags = parseTags(req.body?.tags);
-
-        const iv = String(
-          req.body?.iv ||
-          req.body?.mediaIv ||
-          req.body?.media_iv ||
-          ""
-        ).trim();
-
-        const baseCreationData = parseCreationData(req.body?.creationData);
-        const primaryRenderJson = baseCreationData;
-
-        const sourceMediaJsons = [
-          ...parseJsonArray(req.body?.sourceMediaJsons),
-          ...parseJsonArray(req.body?.source_media_jsons),
-          ...parseJsonArray(req.body?.moderationMediaJsons),
-          ...parseJsonArray(req.body?.moderation_media_jsons),
-        ];
+        const creationData = parseCreationData(req.body?.creationData);
 
         const encryptionEnvelope =
-          primaryRenderJson?.encryption_envelope ||
-          primaryRenderJson?.encryptionEnvelope ||
+          creationData?.encryption_envelope ||
+          creationData?.encryptionEnvelope ||
           null;
 
         if (!title) {
-          cleanup();
+          safeUnlink(req.file?.path);
           return res.status(400).json({ error: "Title required" });
         }
 
         if (!req.file?.path) {
-          cleanup();
           return res.status(400).json({ error: "Encrypted media file required" });
         }
 
         const allowedVis = new Set(["public", "private", "unlisted"]);
         if (!allowedVis.has(visibility)) {
-          cleanup();
+          safeUnlink(req.file?.path);
           return res.status(400).json({
             error: "Visibility must be public, private, or unlisted",
           });
         }
 
         if (!process.env.S3_UPLOADS_BUCKET) {
-          cleanup();
+          safeUnlink(req.file?.path);
           return res.status(500).json({ error: "Missing env S3_UPLOADS_BUCKET" });
         }
 
         if (!process.env.S3_ASSETS_BUCKET) {
-          cleanup();
+          safeUnlink(req.file?.path);
           return res.status(500).json({ error: "Missing env S3_ASSETS_BUCKET" });
         }
 
-        if (!encryptionEnvelope) {
-          cleanup();
+        if (!encryptionEnvelope?.encrypted_dek || !encryptionEnvelope?.media_iv) {
+          safeUnlink(req.file?.path);
           return res.status(400).json({
-            error: "creationData.encryption_envelope is required",
+            error: "creationData.encryption_envelope with encrypted_dek and media_iv is required",
           });
         }
 
-        if (!encryptionEnvelope.encrypted_dek) {
-          cleanup();
-          return res.status(400).json({
-            error: "creationData.encryption_envelope.encrypted_dek required",
-          });
-        }
+        const originalFilename =
+          String(req.body?.originalFilename || "").trim() ||
+          String(req.file.originalname || "").trim() ||
+          path.basename(req.file.path);
 
-        if (!encryptionEnvelope.media_iv) {
-          cleanup();
-          return res.status(400).json({
-            error: "creationData.encryption_envelope.media_iv required",
-          });
-        }
-
-        const originalExt =
-          path.extname(req.body?.originalFilename || "").toLowerCase() ||
-          path.extname(req.file.originalname || "").toLowerCase() ||
-          ".mp4";
-
-        const decryptedPath = path.join(
-          decryptedDir,
-          `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
-        );
-
-        const tKey = nowMs();
-        const rawMediaKey = await getOrCreateUserMediaKey(userId);
-        logStage(reqId, "media key loaded", { ms: elapsed(tKey) });
-
-        const tDecrypt = nowMs();
-        const decryptResult = await decryptFileWithEnvelopeSupport({
-          encryptedPath: req.file.path,
-          outputPath: decryptedPath,
-          rawMediaKey,
-          ivB64: iv,
-          encryptionEnvelope,
-        });
-        logStage(reqId, "decrypted", { ms: elapsed(tDecrypt), mode: decryptResult.mode });
-
-        const moderation = buildModerationPayload({
-          primaryRenderJson,
-          sourceMediaJsons,
-        });
-
-        const moderationCheck = false;
-
-        const creationData = {
-          ...(baseCreationData || {}),
-          moderation,
-        };
-
-        const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
-        const thumbPath = path.join(outDir, thumbName);
-
-        const tPrep = nowMs();
-        const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
-        const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
-        const durationText = formatDurationText(durationSeconds);
-
-        await generateThumbnailWithDuration(decryptedPath, thumbPath, durationSeconds);
-        logStage(reqId, "duration + thumb ready", {
-          ms: elapsed(tPrep),
-          durationSeconds,
-        });
-
-        const tHls = nowMs();
-        const hlsBase = `endpoint-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
-        await generateHlsVOD(decryptedPath, hlsDir);
-
-        const localMaster = path.join(hlsDir, "master.m3u8");
-        if (!fs.existsSync(localMaster)) {
-          throw new Error("HLS export failed: master.m3u8 not created");
-        }
-        logStage(reqId, "hls generated", { ms: elapsed(tHls) });
-
-        const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
-        const assetsBucket = process.env.S3_ASSETS_BUCKET;
-        const hlsKeyPrefix = `hls/${userId}/${hlsBase}`;
-        const thumbKey = `thumbs/${userId}/${thumbName}`;
-
-        const assetsS3 = makeAssetsS3Client();
-
-        const tUpload = nowMs();
-        await Promise.all([
-          uploadDirToS3Concurrent({
-            uploadFileToS3,
-            bucket: uploadsBucket,
-            localDir: hlsDir,
-            keyPrefix: hlsKeyPrefix,
-            concurrency: 6,
-          }),
-          retry(() =>
-            uploadFileToAssetsBucket({
-              assetsS3,
-              bucket: assetsBucket,
-              key: thumbKey,
-              filePath: thumbPath,
-              contentType: "image/jpeg",
-            })
-          ),
-        ]);
-        logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
-
-        const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
-
-        const tDb = nowMs();
         const ins = await pool.query(
           `
-          INSERT INTO videos (
+          INSERT INTO publish_jobs (
             user_id,
             title,
             description,
-            category,
             visibility,
-            media_type,
-            asset_scope,
-            filename,
-            thumb,
-            duration_text,
-            duration,
-            views,
             tags,
+            original_filename,
+            upload_path,
             creation_data,
-            moderation_check
+            status,
+            progress_stage,
+            progress_pct
           )
-          VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9, $10::jsonb, $11)
-          RETURNING id
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'queued', 'queued', 0)
+          RETURNING id, created_at
           `,
           [
             userId,
             title,
             description,
             visibility,
-            hlsMasterKey,
-            thumbKey,
-            durationText,
-            durationSeconds,
             tags,
+            originalFilename,
+            req.file.path,
             JSON.stringify(creationData || {}),
-            moderationCheck,
           ]
         );
-        logStage(reqId, "db insert complete", { ms: elapsed(tDb) });
 
-        const newVideoId = ins.rows[0].id;
+        const jobId = Number(ins.rows[0].id);
 
-        cleanup();
-        logStage(reqId, "done", { totalMs: elapsed(startedAt) });
+        await enqueueJob({ pool, uploadFileToS3, jobId });
 
-        return res.json({
+        logStage(reqId, "job queued", { jobId });
+
+        return res.status(202).json({
           ok: true,
-          videoId: newVideoId,
-          filename: hlsMasterKey,
-          thumb: thumbKey,
-          duration: durationSeconds,
-          durationText,
-          creationData,
-          moderationCheck,
-          moderationStatus: moderation.status,
-          moderationSources: moderation.all_source_urls.length,
-          encryptionMode: decryptResult.mode,
-          ms: elapsed(startedAt),
+          queued: true,
+          jobId,
+          status: "queued",
         });
       } catch (e) {
         console.error(`[endpoint-publish ${reqId}] error:`, e);
-        cleanup();
+        safeUnlink(req.file?.path);
         return res.status(500).json({
           ok: false,
           error: e?.message || "Endpoint publish failed",
         });
+      }
+    }
+  );
+
+  app.get(
+    "/api/endpoint/publish/:jobId",
+    requireAuth,
+    async (req, res) => {
+      const jobId = Number(req.params.jobId);
+
+      if (!Number.isFinite(jobId)) {
+        return res.status(400).json({ error: "Invalid job id" });
+      }
+
+      try {
+        const job = await fetchJob(pool, jobId);
+
+        if (!job || Number(job.user_id) !== Number(req.user.id)) {
+          return res.status(404).json({ error: "Job not found" });
+        }
+
+        return res.json({
+          ok: true,
+          jobId: Number(job.id),
+          status: job.status,
+          progressStage: job.progress_stage,
+          progressPct: Number(job.progress_pct || 0),
+          error: job.error_message || null,
+          videoId: job.video_id || null,
+          createdAt: job.created_at,
+          startedAt: job.started_at,
+          finishedAt: job.finished_at,
+        });
+      } catch (e) {
+        console.error("GET /api/endpoint/publish/:jobId error:", e);
+        return res.status(500).json({ error: "Failed to load publish job" });
       }
     }
   );
