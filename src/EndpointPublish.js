@@ -4,7 +4,7 @@ import os from "os";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import multer from "multer";
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 
@@ -317,6 +317,24 @@ function makeAssetsS3Client() {
   });
 }
 
+function makeUploadsS3Client() {
+  const region =
+    process.env.S3_UPLOADS_REGION ||
+    process.env.AWS_REGION ||
+    process.env.AWS_DEFAULT_REGION;
+
+  if (!region) {
+    throw new Error("Missing env S3_UPLOADS_REGION (or AWS_REGION)");
+  }
+
+  const endpoint = process.env.S3_UPLOADS_ENDPOINT || undefined;
+
+  return new S3Client({
+    region,
+    ...(endpoint ? { endpoint } : {}),
+  });
+}
+
 async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
   const Body = fs.createReadStream(filePath);
 
@@ -329,6 +347,49 @@ async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, conte
       CacheControl: "public, max-age=31536000, immutable",
     })
   );
+}
+
+async function uploadLocalFileToS3({ s3, bucket, key, filePath, contentType }) {
+  const Body = fs.createReadStream(filePath);
+
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body,
+      ContentType: contentType || "application/octet-stream",
+    })
+  );
+}
+
+async function downloadS3ObjectToFile({ s3, bucket, key, filePath }) {
+  const result = await s3.send(
+    new GetObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    })
+  );
+
+  await new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(filePath);
+
+    result.Body.on("error", reject);
+    out.on("error", reject);
+    out.on("close", resolve);
+
+    result.Body.pipe(out);
+  });
+}
+
+async function deleteS3ObjectIfExists({ s3, bucket, key }) {
+  try {
+    await s3.send(
+      new DeleteObjectCommand({
+        Bucket: bucket,
+        Key: key,
+      })
+    );
+  } catch {}
 }
 
 async function retry(fn, { attempts = 2, delayMs = 500 } = {}) {
@@ -650,12 +711,18 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(hlsDir, { recursive: true });
 
+  const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
+  const assetsBucket = process.env.S3_ASSETS_BUCKET;
+  const uploadsS3 = makeUploadsS3Client();
+
+  let localEncryptedPath = null;
+
   try {
     logStage(reqId, "job start", { jobId: job.id });
 
     await updateJob(pool, job.id, {
       status: "processing",
-      progress_stage: "starting",
+      progress_stage: "downloading_source",
       progress_pct: 5,
       started_at: new Date(),
       error_message: null,
@@ -673,15 +740,29 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       throw new Error("creation_data.encryption_envelope is invalid");
     }
 
-    await updateJob(pool, job.id, {
-      progress_stage: "decrypting",
-      progress_pct: 15,
-    });
-
     const originalExt =
       path.extname(job.original_filename || "").toLowerCase() ||
       path.extname(job.upload_path || "").toLowerCase() ||
       ".mp4";
+
+    localEncryptedPath = path.join(
+      tmpRoot,
+      `source-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
+    );
+
+    await downloadS3ObjectToFile({
+      s3: uploadsS3,
+      bucket: uploadsBucket,
+      key: job.upload_path,
+      filePath: localEncryptedPath,
+    });
+
+    logStage(reqId, "source downloaded");
+
+    await updateJob(pool, job.id, {
+      progress_stage: "decrypting",
+      progress_pct: 15,
+    });
 
     const decryptedPath = path.join(
       decryptedDir,
@@ -692,13 +773,16 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
 
     const tDecrypt = nowMs();
     const decryptResult = await decryptFileWithEnvelopeSupport({
-      encryptedPath: job.upload_path,
+      encryptedPath: localEncryptedPath,
       outputPath: decryptedPath,
       rawMediaKey,
       ivB64: "",
       encryptionEnvelope,
     });
     logStage(reqId, "decrypted", { ms: elapsed(tDecrypt), mode: decryptResult.mode });
+
+    safeUnlink(localEncryptedPath);
+    localEncryptedPath = null;
 
     await updateJob(pool, job.id, {
       progress_stage: "probing",
@@ -744,6 +828,8 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
     logStage(reqId, "thumb generated", { ms: elapsed(tThumb) });
     logStage(reqId, "hls generated", { ms: elapsed(tHls) });
 
+    safeUnlink(decryptedPath);
+
     const localMaster = path.join(hlsDir, "master.m3u8");
     if (!fs.existsSync(localMaster)) {
       throw new Error("HLS export failed: master.m3u8 not created");
@@ -754,8 +840,6 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       progress_pct: 75,
     });
 
-    const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
-    const assetsBucket = process.env.S3_ASSETS_BUCKET;
     const hlsKeyPrefix = `hls/${job.user_id}/${hlsBase}`;
     const thumbKey = `thumbs/${job.user_id}/${thumbName}`;
     const assetsS3 = makeAssetsS3Client();
@@ -780,6 +864,9 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       ),
     ]);
     logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
+
+    safeRm(hlsDir);
+    safeUnlink(thumbPath);
 
     await updateJob(pool, job.id, {
       progress_stage: "finalizing",
@@ -835,7 +922,12 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       error_message: null,
     });
 
-    safeUnlink(job.upload_path);
+    await deleteS3ObjectIfExists({
+      s3: uploadsS3,
+      bucket: uploadsBucket,
+      key: job.upload_path,
+    });
+
     safeRm(tmpRoot);
 
     logStage(reqId, "job done", {
@@ -852,6 +944,15 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       error_message: e?.message || "Publish failed",
     }).catch(() => {});
 
+    if (job?.upload_path) {
+      await deleteS3ObjectIfExists({
+        s3: uploadsS3,
+        bucket: uploadsBucket,
+        key: job.upload_path,
+      });
+    }
+
+    safeUnlink(localEncryptedPath);
     safeRm(tmpRoot);
   }
 }
@@ -963,6 +1064,8 @@ export function registerEndpointPublish(app, deps = {}) {
     async (req, res) => {
       const reqId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const userId = Number(req.user.id);
+      const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
+      const uploadsS3 = makeUploadsS3Client();
 
       try {
         logStage(reqId, "request start");
@@ -995,7 +1098,7 @@ export function registerEndpointPublish(app, deps = {}) {
           });
         }
 
-        if (!process.env.S3_UPLOADS_BUCKET) {
+        if (!uploadsBucket) {
           safeUnlink(req.file?.path);
           return res.status(500).json({ error: "Missing env S3_UPLOADS_BUCKET" });
         }
@@ -1016,6 +1119,27 @@ export function registerEndpointPublish(app, deps = {}) {
           String(req.body?.originalFilename || "").trim() ||
           String(req.file.originalname || "").trim() ||
           path.basename(req.file.path);
+
+        const sourceExt =
+          path.extname(originalFilename).toLowerCase() ||
+          path.extname(req.file.path).toLowerCase() ||
+          ".bin";
+
+        const tempSourceKey = `tmp/endpoint-publish/${userId}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}${sourceExt}`;
+
+        logStage(reqId, "uploading source to s3", { key: tempSourceKey });
+
+        await retry(() =>
+          uploadLocalFileToS3({
+            s3: uploadsS3,
+            bucket: uploadsBucket,
+            key: tempSourceKey,
+            filePath: req.file.path,
+            contentType: "application/octet-stream",
+          })
+        );
+
+        safeUnlink(req.file.path);
 
         const ins = await pool.query(
           `
@@ -1042,7 +1166,7 @@ export function registerEndpointPublish(app, deps = {}) {
             visibility,
             tags,
             originalFilename,
-            req.file.path,
+            tempSourceKey,
             JSON.stringify(creationData || {}),
           ]
         );
@@ -1051,7 +1175,7 @@ export function registerEndpointPublish(app, deps = {}) {
 
         await enqueueJob({ pool, uploadFileToS3, jobId });
 
-        logStage(reqId, "job queued", { jobId });
+        logStage(reqId, "job queued", { jobId, tempSourceKey });
 
         return res.status(202).json({
           ok: true,
@@ -1095,6 +1219,7 @@ export function registerEndpointPublish(app, deps = {}) {
           progressPct: Number(job.progress_pct || 0),
           error: job.error_message || null,
           videoId: job.video_id || null,
+          watchUrl: job.video_id ? `/watch/${job.video_id}` : null,
           createdAt: job.created_at,
           startedAt: job.started_at,
           finishedAt: job.finished_at,
