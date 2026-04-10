@@ -326,13 +326,13 @@ function makeUploadsS3Client() {
 }
 
 async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, contentType }) {
-  const Body = fs.createReadStream(filePath);
+  const body = fs.createReadStream(filePath);
 
   await assetsS3.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: key,
-      Body,
+      Body: body,
       ContentType: contentType,
       CacheControl: "public, max-age=31536000, immutable",
     })
@@ -340,13 +340,13 @@ async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, conte
 }
 
 async function uploadLocalFileToS3({ s3, bucket, key, filePath, contentType }) {
-  const Body = fs.createReadStream(filePath);
+  const body = fs.createReadStream(filePath);
 
   await s3.send(
     new PutObjectCommand({
       Bucket: bucket,
       Key: key,
-      Body,
+      Body: body,
       ContentType: contentType || "application/octet-stream",
     })
   );
@@ -700,6 +700,20 @@ export async function requeueStalePublishJobs(pool) {
   return result.rows.map((row) => Number(row.id));
 }
 
+async function fetchVideoById(pool, videoId) {
+  const result = await pool.query(
+    `
+    SELECT *
+    FROM videos
+    WHERE id = $1
+    LIMIT 1
+    `,
+    [videoId]
+  );
+
+  return result.rows[0] || null;
+}
+
 /* ============================================================
    WORKER JOB PROCESSOR
 ============================================================ */
@@ -709,94 +723,52 @@ export async function processPublishJob({ pool, uploadFileToS3, job }) {
   const startedAt = nowMs();
 
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-endpoint-job-"));
-  const decryptedDir = path.join(tmpRoot, "decrypted");
   const outDir = path.join(tmpRoot, "out");
   const hlsDir = path.join(outDir, "hls");
+  const mp4Dir = path.join(tmpRoot, "mp4");
 
-  fs.mkdirSync(decryptedDir, { recursive: true });
   fs.mkdirSync(outDir, { recursive: true });
   fs.mkdirSync(hlsDir, { recursive: true });
+  fs.mkdirSync(mp4Dir, { recursive: true });
 
   const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
-  const assetsBucket = process.env.S3_ASSETS_BUCKET;
   const uploadsS3 = makeUploadsS3Client();
 
-  let localEncryptedPath = null;
-  let decryptedPath = null;
+  let localSourceMp4Path = null;
 
   try {
-    logStage(reqId, "job start", { jobId: job.id });
+    logStage(reqId, "job start", { jobId: job.id, videoId: job.video_id });
 
     await updateJob(pool, job.id, {
       error_message: null,
       finished_at: null,
     });
 
+    if (!job.video_id) {
+      throw new Error("Publish job missing video_id");
+    }
+
+    const video = await fetchVideoById(pool, job.video_id);
+    if (!video) {
+      throw new Error(`Video ${job.video_id} not found for publish job`);
+    }
+
+    if (!video.source_mp4_key) {
+      throw new Error(`Video ${job.video_id} missing source_mp4_key`);
+    }
+
+    await pool.query(
+      `
+      UPDATE videos
+      SET transcode_status = 'processing'
+      WHERE id = $1
+      `,
+      [job.video_id]
+    );
+
     const creationData = job.creation_data || {};
     const primaryRenderJson = creationData;
     const sourceMediaJsons = [];
-    const encryptionEnvelope =
-      primaryRenderJson?.encryption_envelope ||
-      primaryRenderJson?.encryptionEnvelope ||
-      null;
-
-    if (!encryptionEnvelope?.encrypted_dek || !encryptionEnvelope?.media_iv) {
-      throw new Error("creation_data.encryption_envelope is invalid");
-    }
-
-    const originalExt =
-      path.extname(job.original_filename || "").toLowerCase() ||
-      path.extname(job.upload_path || "").toLowerCase() ||
-      ".mp4";
-
-    localEncryptedPath = path.join(
-      tmpRoot,
-      `source-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
-    );
-
-    await updateJob(pool, job.id, {
-      progress_stage: "downloading_source",
-      progress_pct: 5,
-    });
-
-    await downloadS3ObjectToFile({
-      s3: uploadsS3,
-      bucket: uploadsBucket,
-      key: job.upload_path,
-      filePath: localEncryptedPath,
-    });
-
-    logStage(reqId, "source downloaded");
-
-    await updateJob(pool, job.id, {
-      progress_stage: "decrypting",
-      progress_pct: 15,
-    });
-
-    decryptedPath = path.join(
-      decryptedDir,
-      `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
-    );
-
-    const rawMediaKey = await getOrCreateUserMediaKey(job.user_id);
-
-    const tDecrypt = nowMs();
-    const decryptResult = await decryptFileWithEnvelopeSupport({
-      encryptedPath: localEncryptedPath,
-      outputPath: decryptedPath,
-      rawMediaKey,
-      ivB64: "",
-      encryptionEnvelope,
-    });
-    logStage(reqId, "decrypted", { ms: elapsed(tDecrypt), mode: decryptResult.mode });
-
-    safeUnlink(localEncryptedPath);
-    localEncryptedPath = null;
-
-    await updateJob(pool, job.id, {
-      progress_stage: "probing",
-      progress_pct: 30,
-    });
 
     const moderation = buildModerationPayload({
       primaryRenderJson,
@@ -808,38 +780,44 @@ export async function processPublishJob({ pool, uploadFileToS3, job }) {
       moderation,
     };
 
-    const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
-    const thumbPath = path.join(outDir, thumbName);
+    const originalExt =
+      path.extname(video.source_mp4_key || "").toLowerCase() ||
+      path.extname(job.original_filename || "").toLowerCase() ||
+      ".mp4";
 
-    const tProbe = nowMs();
-    const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
-    const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
-    const durationText = formatDurationText(durationSeconds);
+    localSourceMp4Path = path.join(
+      mp4Dir,
+      `source-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
+    );
 
-    logStage(reqId, "duration ready", {
-      ms: elapsed(tProbe),
-      durationSeconds,
+    await updateJob(pool, job.id, {
+      progress_stage: "downloading_source_mp4",
+      progress_pct: 10,
     });
+
+    await downloadS3ObjectToFile({
+      s3: uploadsS3,
+      bucket: uploadsBucket,
+      key: video.source_mp4_key,
+      filePath: localSourceMp4Path,
+    });
+
+    logStage(reqId, "source mp4 downloaded", { source_mp4_key: video.source_mp4_key });
 
     await updateJob(pool, job.id, {
       progress_stage: "transcoding",
       progress_pct: 45,
     });
 
-    const tThumb = nowMs();
     const tHls = nowMs();
     const hlsBase = `endpoint-${Date.now()}-${crypto.randomBytes(6).toString("hex")}`;
 
-    await Promise.all([
-      generateThumbnailWithDuration(decryptedPath, thumbPath, durationSeconds),
-      generateHlsVOD(decryptedPath, hlsDir),
-    ]);
+    await generateHlsVOD(localSourceMp4Path, hlsDir);
 
-    logStage(reqId, "thumb generated", { ms: elapsed(tThumb) });
     logStage(reqId, "hls generated", { ms: elapsed(tHls) });
 
-    safeUnlink(decryptedPath);
-    decryptedPath = null;
+    safeUnlink(localSourceMp4Path);
+    localSourceMp4Path = null;
 
     const localMaster = path.join(hlsDir, "master.m3u8");
     if (!fs.existsSync(localMaster)) {
@@ -847,104 +825,72 @@ export async function processPublishJob({ pool, uploadFileToS3, job }) {
     }
 
     await updateJob(pool, job.id, {
-      progress_stage: "uploading_assets",
+      progress_stage: "uploading_hls",
       progress_pct: 75,
     });
 
     const hlsKeyPrefix = `hls/${job.user_id}/${hlsBase}`;
-    const thumbKey = `thumbs/${job.user_id}/${thumbName}`;
-    const assetsS3 = makeAssetsS3Client();
+    const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
 
     const tUpload = nowMs();
-    await Promise.all([
-      uploadDirToS3Concurrent({
-        uploadFileToS3,
-        bucket: uploadsBucket,
-        localDir: hlsDir,
-        keyPrefix: hlsKeyPrefix,
-        concurrency: 8,
-      }),
-      retry(() =>
-        uploadFileToAssetsBucket({
-          assetsS3,
-          bucket: assetsBucket,
-          key: thumbKey,
-          filePath: thumbPath,
-          contentType: "image/jpeg",
-        })
-      ),
-    ]);
+    await uploadDirToS3Concurrent({
+      uploadFileToS3,
+      bucket: uploadsBucket,
+      localDir: hlsDir,
+      keyPrefix: hlsKeyPrefix,
+      concurrency: 8,
+    });
 
-    logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
+    logStage(reqId, "hls uploaded", { ms: elapsed(tUpload), hlsMasterKey });
 
     safeRm(hlsDir);
-    safeUnlink(thumbPath);
 
     await updateJob(pool, job.id, {
       progress_stage: "finalizing",
       progress_pct: 90,
     });
 
-    const hlsMasterKey = `${hlsKeyPrefix}/master.m3u8`;
-
-    const ins = await pool.query(
+    await pool.query(
       `
-      INSERT INTO videos (
-        user_id,
-        title,
-        description,
-        category,
-        visibility,
-        media_type,
-        asset_scope,
-        filename,
-        thumb,
-        duration_text,
-        duration,
-        views,
-        tags,
-        creation_data,
-        moderation_check
-      )
-      VALUES ($1, $2, $3, 'Other', $4, 'video', 'public', $5, $6, $7, $8, 0, $9, $10::jsonb, false)
-      RETURNING id
+      UPDATE videos
+      SET
+        filename = $2,
+        hls_master_key = $2,
+        playback_mode = 'hls',
+        transcode_status = 'ready',
+        creation_data = $3::jsonb
+      WHERE id = $1
       `,
       [
-        job.user_id,
-        job.title,
-        job.description,
-        job.visibility,
+        job.video_id,
         hlsMasterKey,
-        thumbKey,
-        durationText,
-        durationSeconds,
-        job.tags || [],
         JSON.stringify(finalCreationData || {}),
       ]
     );
-
-    const videoId = ins.rows[0].id;
 
     await updateJob(pool, job.id, {
       status: "complete",
       progress_stage: "complete",
       progress_pct: 100,
       finished_at: new Date(),
-      video_id: videoId,
+      video_id: job.video_id,
       error_message: null,
     });
 
-    await deleteS3ObjectIfExists({
-      s3: uploadsS3,
-      bucket: uploadsBucket,
-      key: job.upload_path,
-    });
+    if (job.upload_path) {
+      await deleteS3ObjectIfExists({
+        s3: uploadsS3,
+        bucket: uploadsBucket,
+        key: job.upload_path,
+      });
+    }
 
     safeRm(tmpRoot);
 
     logStage(reqId, "job done", {
       totalMs: elapsed(startedAt),
-      videoId,
+      videoId: job.video_id,
+      hlsMasterKey,
     });
   } catch (e) {
     console.error(`[endpoint-publish worker ${job.id}] error:`, e);
@@ -956,16 +902,18 @@ export async function processPublishJob({ pool, uploadFileToS3, job }) {
       error_message: e?.message || "Publish failed",
     }).catch(() => {});
 
-    if (job?.upload_path) {
-      await deleteS3ObjectIfExists({
-        s3: uploadsS3,
-        bucket: uploadsBucket,
-        key: job.upload_path,
-      });
+    if (job.video_id) {
+      await pool.query(
+        `
+        UPDATE videos
+        SET transcode_status = 'failed'
+        WHERE id = $1
+        `,
+        [job.video_id]
+      ).catch(() => {});
     }
 
-    safeUnlink(localEncryptedPath);
-    safeUnlink(decryptedPath);
+    safeUnlink(localSourceMp4Path);
     safeRm(tmpRoot);
   }
 }
@@ -1005,7 +953,19 @@ export function registerEndpointPublish(app, deps = {}) {
       const reqId = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
       const userId = Number(req.user.id);
       const uploadsBucket = process.env.S3_UPLOADS_BUCKET;
+      const assetsBucket = process.env.S3_ASSETS_BUCKET;
       const uploadsS3 = makeUploadsS3Client();
+      const assetsS3 = makeAssetsS3Client();
+
+      const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mytube-endpoint-request-"));
+      const decryptedDir = path.join(tmpRoot, "decrypted");
+      const thumbsDir = path.join(tmpRoot, "thumbs");
+
+      fs.mkdirSync(decryptedDir, { recursive: true });
+      fs.mkdirSync(thumbsDir, { recursive: true });
+
+      let decryptedPath = null;
+      let thumbPath = null;
 
       try {
         logStage(reqId, "request start");
@@ -1025,16 +985,19 @@ export function registerEndpointPublish(app, deps = {}) {
 
         if (!title) {
           safeUnlink(req.file?.path);
+          safeRm(tmpRoot);
           return res.status(400).json({ error: "Title required" });
         }
 
         if (!req.file?.path) {
+          safeRm(tmpRoot);
           return res.status(400).json({ error: "Encrypted media file required" });
         }
 
         const allowedVis = new Set(["public", "private", "unlisted"]);
         if (!allowedVis.has(visibility)) {
           safeUnlink(req.file?.path);
+          safeRm(tmpRoot);
           return res.status(400).json({
             error: "Visibility must be public, private, or unlisted",
           });
@@ -1042,16 +1005,19 @@ export function registerEndpointPublish(app, deps = {}) {
 
         if (!uploadsBucket) {
           safeUnlink(req.file?.path);
+          safeRm(tmpRoot);
           return res.status(500).json({ error: "Missing env S3_UPLOADS_BUCKET" });
         }
 
-        if (!process.env.S3_ASSETS_BUCKET) {
+        if (!assetsBucket) {
           safeUnlink(req.file?.path);
+          safeRm(tmpRoot);
           return res.status(500).json({ error: "Missing env S3_ASSETS_BUCKET" });
         }
 
         if (!encryptionEnvelope?.encrypted_dek || !encryptionEnvelope?.media_iv) {
           safeUnlink(req.file?.path);
+          safeRm(tmpRoot);
           return res.status(400).json({
             error: "creationData.encryption_envelope with encrypted_dek and media_iv is required",
           });
@@ -1071,7 +1037,7 @@ export function registerEndpointPublish(app, deps = {}) {
           .randomBytes(8)
           .toString("hex")}${sourceExt}`;
 
-        logStage(reqId, "uploading source to s3", {
+        logStage(reqId, "uploading encrypted temp source", {
           bucket: uploadsBucket,
           key: tempSourceKey,
         });
@@ -1086,54 +1052,183 @@ export function registerEndpointPublish(app, deps = {}) {
           })
         );
 
-        safeUnlink(req.file.path);
-
-        const ins = await pool.query(
-          `
-          INSERT INTO publish_jobs (
-            user_id,
-            title,
-            description,
-            visibility,
-            tags,
-            original_filename,
-            upload_path,
-            creation_data,
-            status,
-            progress_stage,
-            progress_pct
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, 'queued', 'queued', 0)
-          RETURNING id, created_at
-          `,
-          [
-            userId,
-            title,
-            description,
-            visibility,
-            tags,
-            originalFilename,
-            tempSourceKey,
-            JSON.stringify(creationData || {}),
-          ]
+        decryptedPath = path.join(
+          decryptedDir,
+          `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.mp4`
         );
 
-        const jobId = Number(ins.rows[0].id);
+        const rawMediaKey = await getOrCreateUserMediaKey(userId);
 
-        logStage(reqId, "job queued", {
+        await decryptFileWithEnvelopeSupport({
+          encryptedPath: req.file.path,
+          outputPath: decryptedPath,
+          rawMediaKey,
+          ivB64: "",
+          encryptionEnvelope,
+        });
+
+        safeUnlink(req.file.path);
+
+        const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
+        const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
+        const durationText = formatDurationText(durationSeconds);
+
+        const thumbName = `thumb-${Date.now()}-${crypto.randomBytes(6).toString("hex")}.jpg`;
+        thumbPath = path.join(thumbsDir, thumbName);
+
+        await generateThumbnailWithDuration(decryptedPath, thumbPath, durationSeconds);
+
+        const sourceMp4Key = `source/${userId}/${Date.now()}-${crypto
+          .randomBytes(8)
+          .toString("hex")}.mp4`;
+
+        await retry(() =>
+          uploadLocalFileToS3({
+            s3: uploadsS3,
+            bucket: uploadsBucket,
+            key: sourceMp4Key,
+            filePath: decryptedPath,
+            contentType: "video/mp4",
+          })
+        );
+
+        const thumbKey = `thumbs/${userId}/${thumbName}`;
+
+        await retry(() =>
+          uploadFileToAssetsBucket({
+            assetsS3,
+            bucket: assetsBucket,
+            key: thumbKey,
+            filePath: thumbPath,
+            contentType: "image/jpeg",
+          })
+        );
+
+        const client = await pool.connect();
+        let videoId;
+        let jobId;
+
+        try {
+          await client.query("BEGIN");
+
+          const videoInsert = await client.query(
+            `
+            INSERT INTO videos (
+              user_id,
+              title,
+              description,
+              category,
+              visibility,
+              media_type,
+              asset_scope,
+              filename,
+              source_mp4_key,
+              hls_master_key,
+              playback_mode,
+              transcode_status,
+              thumb,
+              duration_text,
+              duration,
+              views,
+              tags,
+              creation_data,
+              moderation_check
+            )
+            VALUES (
+              $1, $2, $3, 'Other', $4, 'video', 'public',
+              $5, $5, NULL, 'mp4', 'queued',
+              $6, $7, $8, 0, $9, $10::jsonb, false
+            )
+            RETURNING id
+            `,
+            [
+              userId,
+              title,
+              description,
+              visibility,
+              sourceMp4Key,
+              thumbKey,
+              durationText,
+              durationSeconds,
+              tags,
+              JSON.stringify(creationData || {}),
+            ]
+          );
+
+          videoId = Number(videoInsert.rows[0].id);
+
+          const jobInsert = await client.query(
+            `
+            INSERT INTO publish_jobs (
+              user_id,
+              video_id,
+              title,
+              description,
+              visibility,
+              tags,
+              original_filename,
+              upload_path,
+              creation_data,
+              status,
+              progress_stage,
+              progress_pct
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, 'queued', 'queued', 0)
+            RETURNING id
+            `,
+            [
+              userId,
+              videoId,
+              title,
+              description,
+              visibility,
+              tags,
+              originalFilename,
+              tempSourceKey,
+              JSON.stringify(creationData || {}),
+            ]
+          );
+
+          jobId = Number(jobInsert.rows[0].id);
+
+          await client.query("COMMIT");
+        } catch (dbErr) {
+          await client.query("ROLLBACK").catch(() => {});
+          throw dbErr;
+        } finally {
+          client.release();
+        }
+
+        safeUnlink(decryptedPath);
+        decryptedPath = null;
+        safeUnlink(thumbPath);
+        thumbPath = null;
+        safeRm(tmpRoot);
+
+        logStage(reqId, "immediate publish complete", {
+          videoId,
           jobId,
-          tempSourceKey,
+          sourceMp4Key,
+          thumbKey,
         });
 
         return res.status(202).json({
           ok: true,
           queued: true,
           jobId,
+          videoId,
           status: "queued",
+          playbackMode: "mp4",
+          transcodeStatus: "queued",
+          watchUrl: `/watch/${videoId}`,
         });
       } catch (e) {
         console.error(`[endpoint-publish ${reqId}] error:`, e);
         safeUnlink(req.file?.path);
+        safeUnlink(decryptedPath);
+        safeUnlink(thumbPath);
+        safeRm(tmpRoot);
+
         return res.status(500).json({
           ok: false,
           error: e?.message || "Endpoint publish failed",
@@ -1159,6 +1254,11 @@ export function registerEndpointPublish(app, deps = {}) {
           return res.status(404).json({ error: "Job not found" });
         }
 
+        let video = null;
+        if (job.video_id) {
+          video = await fetchVideoById(pool, job.video_id);
+        }
+
         return res.json({
           ok: true,
           jobId: Number(job.id),
@@ -1171,6 +1271,10 @@ export function registerEndpointPublish(app, deps = {}) {
           createdAt: job.created_at,
           startedAt: job.started_at,
           finishedAt: job.finished_at,
+          playbackMode: video?.playback_mode || null,
+          transcodeStatus: video?.transcode_status || null,
+          sourceMp4Key: video?.source_mp4_key || null,
+          hlsMasterKey: video?.hls_master_key || null,
         });
       } catch (e) {
         console.error("GET /api/endpoint/publish/:jobId error:", e);

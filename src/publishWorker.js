@@ -2,7 +2,10 @@ import fs from "fs";
 import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
 
 import { pool } from "./db.js";
-import { processPublishJob } from "./EndpointPublish.js";
+import {
+  processPublishJob,
+  requeueStalePublishJobs,
+} from "./EndpointPublish.js";
 
 const POLL_INTERVAL = 3000;
 
@@ -73,6 +76,11 @@ async function workerLoop() {
   await pool.query("SELECT 1");
   console.log("✅ DB connected");
 
+  const staleIds = await requeueStalePublishJobs(pool);
+  if (staleIds.length) {
+    console.log("♻️ Requeued stale jobs:", staleIds);
+  }
+
   while (true) {
     try {
       const job = await claimNextJob();
@@ -82,7 +90,7 @@ async function workerLoop() {
         continue;
       }
 
-      console.log(`🎬 Processing job ${job.id}`);
+      console.log(`🎬 Processing job ${job.id} for video ${job.video_id}`);
 
       await processPublishJob({
         pool,
