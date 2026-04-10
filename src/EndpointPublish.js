@@ -262,7 +262,7 @@ async function generateHlsVOD(inputPath, outDir) {
     "-i",
     inputPath,
     "-vf",
-    "scale='min(1280,iw)':-2:force_original_aspect_ratio=decrease,format=yuv420p",
+    "scale='if(gt(iw,1280),1280,trunc(iw/2)*2)':'-2',format=yuv420p",
     "-c:v",
     "libx264",
     "-preset",
