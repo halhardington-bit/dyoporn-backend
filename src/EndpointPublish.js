@@ -4,7 +4,12 @@ import os from "os";
 import crypto from "crypto";
 import { spawn } from "child_process";
 import multer from "multer";
-import { PutObjectCommand, GetObjectCommand, DeleteObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import {
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+  S3Client,
+} from "@aws-sdk/client-s3";
 
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 
@@ -73,21 +78,6 @@ function parseCreationData(raw) {
     return {};
   } catch {
     return {};
-  }
-}
-
-function parseJsonArray(raw) {
-  if (raw == null) return [];
-  if (Array.isArray(raw)) return raw;
-
-  const text = String(raw).trim();
-  if (!text) return [];
-
-  try {
-    const parsed = JSON.parse(text);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
   }
 }
 
@@ -206,7 +196,7 @@ async function generateThumbnailAtSecond(videoPath, thumbPath, seconds) {
     "-frames:v",
     "1",
     "-vf",
-    "scale=480:-2",
+    "scale=480:270:force_original_aspect_ratio=decrease,pad=480:270:(ow-iw)/2:(oh-ih)/2",
     "-q:v",
     "4",
     thumbPath,
@@ -261,15 +251,8 @@ async function generateHlsVOD(inputPath, outDir) {
     "0",
     "-i",
     inputPath,
-
-    // Always produce a clean, standard 1280x720 frame:
-    // - preserve aspect ratio
-    // - never stretch
-    // - pad with black bars if needed
-    // - guaranteed even dimensions for libx264
     "-vf",
     "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-
     "-c:v",
     "libx264",
     "-preset",
@@ -278,14 +261,12 @@ async function generateHlsVOD(inputPath, outDir) {
     "24",
     "-pix_fmt",
     "yuv420p",
-
     "-c:a",
     "aac",
     "-b:a",
     "128k",
     "-ac",
     "2",
-
     "-f",
     "hls",
     "-hls_time",
@@ -665,15 +646,10 @@ async function decryptFileWithEnvelopeSupport({
 }
 
 /* ============================================================
-   JOB WORKER
+   DB HELPERS
 ============================================================ */
 
-let queueStarted = false;
-const queuedJobIds = new Set();
-let activeWorkers = 0;
-const MAX_WORKERS = 1;
-
-async function updateJob(pool, jobId, patch = {}) {
+export async function updateJob(pool, jobId, patch = {}) {
   const sets = [];
   const values = [];
   let i = 1;
@@ -693,7 +669,7 @@ async function updateJob(pool, jobId, patch = {}) {
   );
 }
 
-async function fetchJob(pool, jobId) {
+export async function fetchJob(pool, jobId) {
   const result = await pool.query(
     `
     SELECT *
@@ -707,7 +683,28 @@ async function fetchJob(pool, jobId) {
   return result.rows[0] || null;
 }
 
-async function processPublishJob({ pool, uploadFileToS3, job }) {
+export async function requeueStalePublishJobs(pool) {
+  const result = await pool.query(`
+    UPDATE publish_jobs
+    SET
+      status = 'queued',
+      progress_stage = 'queued',
+      progress_pct = 0,
+      error_message = NULL,
+      started_at = NULL,
+      finished_at = NULL
+    WHERE status = 'processing'
+    RETURNING id
+  `);
+
+  return result.rows.map((row) => Number(row.id));
+}
+
+/* ============================================================
+   WORKER JOB PROCESSOR
+============================================================ */
+
+export async function processPublishJob({ pool, uploadFileToS3, job }) {
   const reqId = `job-${job.id}-${crypto.randomBytes(4).toString("hex")}`;
   const startedAt = nowMs();
 
@@ -725,16 +722,14 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
   const uploadsS3 = makeUploadsS3Client();
 
   let localEncryptedPath = null;
+  let decryptedPath = null;
 
   try {
     logStage(reqId, "job start", { jobId: job.id });
 
     await updateJob(pool, job.id, {
-      status: "processing",
-      progress_stage: "downloading_source",
-      progress_pct: 5,
-      started_at: new Date(),
       error_message: null,
+      finished_at: null,
     });
 
     const creationData = job.creation_data || {};
@@ -759,6 +754,11 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       `source-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
     );
 
+    await updateJob(pool, job.id, {
+      progress_stage: "downloading_source",
+      progress_pct: 5,
+    });
+
     await downloadS3ObjectToFile({
       s3: uploadsS3,
       bucket: uploadsBucket,
@@ -773,7 +773,7 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
       progress_pct: 15,
     });
 
-    const decryptedPath = path.join(
+    decryptedPath = path.join(
       decryptedDir,
       `decrypted-${Date.now()}-${crypto.randomBytes(6).toString("hex")}${originalExt || ".mp4"}`
     );
@@ -815,6 +815,7 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
     const durationSecondsRaw = await getVideoDurationSeconds(decryptedPath);
     const durationSeconds = Math.max(0, Math.floor(Number(durationSecondsRaw) || 0));
     const durationText = formatDurationText(durationSeconds);
+
     logStage(reqId, "duration ready", {
       ms: elapsed(tProbe),
       durationSeconds,
@@ -838,6 +839,7 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
     logStage(reqId, "hls generated", { ms: elapsed(tHls) });
 
     safeUnlink(decryptedPath);
+    decryptedPath = null;
 
     const localMaster = path.join(hlsDir, "master.m3u8");
     if (!fs.existsSync(localMaster)) {
@@ -872,6 +874,7 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
         })
       ),
     ]);
+
     logStage(reqId, "uploads complete", { ms: elapsed(tUpload) });
 
     safeRm(hlsDir);
@@ -962,78 +965,9 @@ async function processPublishJob({ pool, uploadFileToS3, job }) {
     }
 
     safeUnlink(localEncryptedPath);
+    safeUnlink(decryptedPath);
     safeRm(tmpRoot);
   }
-}
-
-async function pumpQueue({ pool, uploadFileToS3 }) {
-  if (activeWorkers >= MAX_WORKERS) return;
-
-  const available = MAX_WORKERS - activeWorkers;
-  const ids = Array.from(queuedJobIds).slice(0, available);
-
-  for (const jobId of ids) {
-    queuedJobIds.delete(jobId);
-    activeWorkers += 1;
-
-    (async () => {
-      try {
-        const job = await fetchJob(pool, jobId);
-        if (!job) return;
-        if (job.status === "complete") return;
-
-        await processPublishJob({ pool, uploadFileToS3, job });
-      } finally {
-        activeWorkers -= 1;
-        setImmediate(() => {
-          pumpQueue({ pool, uploadFileToS3 }).catch((err) => {
-            console.error("[endpoint-publish queue pump] error:", err);
-          });
-        });
-      }
-    })();
-  }
-}
-
-async function enqueueJob({ pool, uploadFileToS3, jobId }) {
-  queuedJobIds.add(jobId);
-  setImmediate(() => {
-    pumpQueue({ pool, uploadFileToS3 }).catch((err) => {
-      console.error("[endpoint-publish enqueue] error:", err);
-    });
-  });
-}
-
-function startRecoveryLoop({ pool, uploadFileToS3 }) {
-  if (queueStarted) return;
-  queueStarted = true;
-
-  const recover = async () => {
-    try {
-      const result = await pool.query(
-        `
-        SELECT id
-        FROM publish_jobs
-        WHERE status IN ('queued', 'processing')
-        ORDER BY id ASC
-        LIMIT 20
-        `
-      );
-
-      for (const row of result.rows) {
-        queuedJobIds.add(Number(row.id));
-      }
-
-      await pumpQueue({ pool, uploadFileToS3 });
-    } catch (e) {
-      console.error("[endpoint-publish recovery] error:", e);
-    }
-  };
-
-  recover().catch(() => {});
-  setInterval(() => {
-    recover().catch(() => {});
-  }, 5000);
 }
 
 /* ============================================================
@@ -1041,13 +975,10 @@ function startRecoveryLoop({ pool, uploadFileToS3 }) {
 ============================================================ */
 
 export function registerEndpointPublish(app, deps = {}) {
-  const { pool, requireAuth, uploadFileToS3 } = deps;
+  const { pool, requireAuth } = deps;
 
   if (!pool) throw new Error("registerEndpointPublish: missing pool");
   if (!requireAuth) throw new Error("registerEndpointPublish: missing requireAuth");
-  if (!uploadFileToS3) throw new Error("registerEndpointPublish: missing uploadFileToS3");
-
-  startRecoveryLoop({ pool, uploadFileToS3 });
 
   const TMP_UPLOAD_DIR = path.join(os.tmpdir(), "mytube-endpoint-publish-uploads");
   fs.mkdirSync(TMP_UPLOAD_DIR, { recursive: true });
@@ -1081,7 +1012,9 @@ export function registerEndpointPublish(app, deps = {}) {
 
         const title = String(req.body?.title || "").trim();
         const description = String(req.body?.description || "").trim();
-        const visibility = String(req.body?.visibility || "public").trim().toLowerCase();
+        const visibility = String(req.body?.visibility || "public")
+          .trim()
+          .toLowerCase();
         const tags = parseTags(req.body?.tags);
         const creationData = parseCreationData(req.body?.creationData);
 
@@ -1134,9 +1067,14 @@ export function registerEndpointPublish(app, deps = {}) {
           path.extname(req.file.path).toLowerCase() ||
           ".bin";
 
-        const tempSourceKey = `tmp/endpoint-publish/${userId}/${Date.now()}-${crypto.randomBytes(8).toString("hex")}${sourceExt}`;
+        const tempSourceKey = `tmp/endpoint-publish/${userId}/${Date.now()}-${crypto
+          .randomBytes(8)
+          .toString("hex")}${sourceExt}`;
 
-        logStage(reqId, "uploading source to s3", { key: tempSourceKey });
+        logStage(reqId, "uploading source to s3", {
+          bucket: uploadsBucket,
+          key: tempSourceKey,
+        });
 
         await retry(() =>
           uploadLocalFileToS3({
@@ -1182,9 +1120,10 @@ export function registerEndpointPublish(app, deps = {}) {
 
         const jobId = Number(ins.rows[0].id);
 
-        await enqueueJob({ pool, uploadFileToS3, jobId });
-
-        logStage(reqId, "job queued", { jobId, tempSourceKey });
+        logStage(reqId, "job queued", {
+          jobId,
+          tempSourceKey,
+        });
 
         return res.status(202).json({
           ok: true,
