@@ -261,8 +261,15 @@ async function generateHlsVOD(inputPath, outDir) {
     "0",
     "-i",
     inputPath,
+
+    // Always produce a clean, standard 1280x720 frame:
+    // - preserve aspect ratio
+    // - never stretch
+    // - pad with black bars if needed
+    // - guaranteed even dimensions for libx264
     "-vf",
-    "scale='trunc(min(iw,1280)/2)*2':'trunc(min(ih,720)/2)*2':force_original_aspect_ratio=decrease,format=yuv420p",
+    "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+
     "-c:v",
     "libx264",
     "-preset",
@@ -271,12 +278,14 @@ async function generateHlsVOD(inputPath, outDir) {
     "24",
     "-pix_fmt",
     "yuv420p",
+
     "-c:a",
     "aac",
     "-b:a",
     "128k",
     "-ac",
     "2",
+
     "-f",
     "hls",
     "-hls_time",
