@@ -377,18 +377,173 @@ app.patch("/api/me/tier", requireAuth, async (req, res) => {
   }
 });
 
-app.get("/system/latest-version.json", (_req, res) => {
-  return res.json(LATEST_VERSION_MANIFEST);
+app.get("/system/latest-version.json", async (req, res) => {
+  const channel = String(req.query.channel || "beta").trim().toLowerCase();
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        latest_version,
+        patch_url,
+        critical_update,
+        release_notes
+      FROM app_versions
+      WHERE channel = $1
+      LIMIT 1
+      `,
+      [channel]
+    );
+
+    const row = result.rows[0];
+
+    if (!row) {
+      return res.json({
+        latest_version: "1.0.4-beta",
+        critical_update: false,
+        engine_patch_url: null,
+        release_notes: "",
+      });
+    }
+
+    return res.json({
+      latest_version: row.latest_version,
+      critical_update: !!row.critical_update,
+      engine_patch_url: row.patch_url || null,
+      release_notes: row.release_notes || "",
+    });
+  } catch (e) {
+    console.error("GET /system/latest-version.json error:", e);
+    return res.status(500).json({
+      error: "Failed to load version manifest",
+    });
+  }
 });
 
-app.get("/api/system/version", (_req, res) => {
-  return res.json({
-    current: APP_CURRENT_VERSION,
-    latest: LATEST_VERSION_MANIFEST.latest_version || APP_CURRENT_VERSION,
-    patch_url: LATEST_VERSION_MANIFEST.engine_patch_url || null,
-    critical_update: !!LATEST_VERSION_MANIFEST.critical_update,
-    release_notes: LATEST_VERSION_MANIFEST.release_notes || "",
-  });
+app.patch("/api/system/version", requireAuth, requireModerator, async (req, res) => {
+  const channel = String(req.body?.channel || "beta").trim().toLowerCase();
+  const currentVersion = String(req.body?.current_version || "").trim();
+  const latestVersion = String(req.body?.latest_version || "").trim();
+  const patchUrlRaw = String(req.body?.patch_url || "").trim();
+  const releaseNotes = String(req.body?.release_notes || "");
+  const criticalUpdate = !!req.body?.critical_update;
+
+  if (!channel) {
+    return res.status(400).json({ error: "channel is required" });
+  }
+
+  if (!currentVersion) {
+    return res.status(400).json({ error: "current_version is required" });
+  }
+
+  if (!latestVersion) {
+    return res.status(400).json({ error: "latest_version is required" });
+  }
+
+  const patchUrl = patchUrlRaw || null;
+
+  try {
+    const result = await pool.query(
+      `
+      INSERT INTO app_versions (
+        channel,
+        current_version,
+        latest_version,
+        patch_url,
+        critical_update,
+        release_notes,
+        updated_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      ON CONFLICT (channel)
+      DO UPDATE SET
+        current_version = EXCLUDED.current_version,
+        latest_version = EXCLUDED.latest_version,
+        patch_url = EXCLUDED.patch_url,
+        critical_update = EXCLUDED.critical_update,
+        release_notes = EXCLUDED.release_notes,
+        updated_at = NOW()
+      RETURNING
+        channel,
+        current_version,
+        latest_version,
+        patch_url,
+        critical_update,
+        release_notes,
+        updated_at
+      `,
+      [
+        channel,
+        currentVersion,
+        latestVersion,
+        patchUrl,
+        criticalUpdate,
+        releaseNotes,
+      ]
+    );
+
+    const row = result.rows[0];
+
+    return res.json({
+      ok: true,
+      version: {
+        channel: row.channel,
+        current: row.current_version,
+        latest: row.latest_version,
+        patch_url: row.patch_url,
+        critical_update: !!row.critical_update,
+        release_notes: row.release_notes || "",
+        updated_at: row.updated_at,
+      },
+    });
+  } catch (e) {
+    console.error("PATCH /api/system/version error:", e);
+    return res.status(500).json({ error: "Failed to update version info" });
+  }
+});
+
+app.get("/api/system/version", async (req, res) => {
+  const channel = String(req.query.channel || "beta").trim().toLowerCase();
+
+  try {
+    const result = await pool.query(
+      `
+      SELECT
+        current_version,
+        latest_version,
+        patch_url,
+        critical_update,
+        release_notes
+      FROM app_versions
+      WHERE channel = $1
+      LIMIT 1
+      `,
+      [channel]
+    );
+
+    const row = result.rows[0];
+
+    if (!row) {
+      return res.json({
+        current: "1.0.4-beta",
+        latest: "1.0.4-beta",
+        patch_url: null,
+      });
+    }
+
+    return res.json({
+      current: row.current_version,
+      latest: row.latest_version,
+      patch_url: row.patch_url || null,
+      critical_update: !!row.critical_update,
+      release_notes: row.release_notes || "",
+    });
+  } catch (e) {
+    console.error("GET /api/system/version error:", e);
+    return res.status(500).json({
+      error: "Failed to load version info",
+    });
+  }
 });
 
 app.get("/api/me/media-key", requireAuth, async (req, res) => {
