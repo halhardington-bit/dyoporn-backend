@@ -278,6 +278,17 @@ const VIDEO_SOURCE = process.env.VIDEO_SOURCE || "local"; // "local" | "aws"
 const CDN_UPLOADS_BASE_URL = (process.env.CDN_UPLOADS_BASE_URL || "").replace(/\/$/, "");
 const CDN_ASSETS_BASE_URL = (process.env.CDN_ASSETS_BASE_URL || "").replace(/\/$/, "");
 
+const APP_CURRENT_VERSION = process.env.APP_CURRENT_VERSION || "1.0.4-beta";
+
+const LATEST_VERSION_MANIFEST = {
+  latest_version: "1.0.5-beta",
+  critical_update: false,
+  engine_patch_url:
+    "https://drive.google.com/uc?export=download&id=YOUR_GOOGLE_DRIVE_FILE_ID",
+  release_notes:
+    "Fixed FlashVSR variance explosion and improved warp blending.",
+};
+
 // -------------------------
 // Session -> req.user
 // -------------------------
@@ -364,6 +375,20 @@ app.patch("/api/me/tier", requireAuth, async (req, res) => {
     console.error("PATCH /api/me/tier error:", e);
     return res.status(500).json({ error: "Failed to update tier" });
   }
+});
+
+app.get("/system/latest-version.json", (_req, res) => {
+  return res.json(LATEST_VERSION_MANIFEST);
+});
+
+app.get("/api/system/version", (_req, res) => {
+  return res.json({
+    current: APP_CURRENT_VERSION,
+    latest: LATEST_VERSION_MANIFEST.latest_version || APP_CURRENT_VERSION,
+    patch_url: LATEST_VERSION_MANIFEST.engine_patch_url || null,
+    critical_update: !!LATEST_VERSION_MANIFEST.critical_update,
+    release_notes: LATEST_VERSION_MANIFEST.release_notes || "",
+  });
 });
 
 app.get("/api/me/media-key", requireAuth, async (req, res) => {
