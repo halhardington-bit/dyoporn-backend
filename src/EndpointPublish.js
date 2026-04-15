@@ -163,6 +163,36 @@ function runCmd(cmd, args, { cwd } = {}) {
   });
 }
 
+async function getVideoDimensions(videoPath) {
+  try {
+    const { out } = await runCmd("ffprobe", [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_entries",
+      "stream=width,height",
+      "-of",
+      "json",
+      videoPath,
+    ]);
+
+    const parsed = JSON.parse(out);
+    const stream = parsed?.streams?.[0];
+
+    const width = Number(stream?.width || 0);
+    const height = Number(stream?.height || 0);
+
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+      return null;
+    }
+
+    return { width, height };
+  } catch {
+    return null;
+  }
+}
+
 async function getVideoDurationSeconds(videoPath) {
   try {
     const { out } = await runCmd("ffprobe", [
@@ -242,6 +272,26 @@ async function generateThumbnailWithDuration(videoPath, thumbPath, durationSecon
 async function generateHlsVOD(inputPath, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
 
+  const dims = await getVideoDimensions(inputPath);
+  const width = Number(dims?.width || 0);
+  const height = Number(dims?.height || 0);
+
+  const isPortrait = height > width;
+  const isSquare = width > 0 && height > 0 && Math.abs(width - height) < 8;
+
+  let vf;
+
+  if (isPortrait) {
+    vf =
+      "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
+  } else if (isSquare) {
+    vf =
+      "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
+  } else {
+    vf =
+      "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p";
+  }
+
   const args = [
     "-y",
     "-hide_banner",
@@ -252,7 +302,7 @@ async function generateHlsVOD(inputPath, outDir) {
     "-i",
     inputPath,
     "-vf",
-    "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+    vf,
     "-c:v",
     "libx264",
     "-preset",
