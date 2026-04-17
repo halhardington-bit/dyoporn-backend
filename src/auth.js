@@ -20,6 +20,8 @@ import { OAuth2Client } from "google-auth-library";
 
 const router = express.Router();
 const googleTokenClient = new OAuth2Client();
+const FRONTEND_BASE_URL =
+  process.env.FRONTEND_BASE_URL || "http://localhost:5173";
 
 function cookieOptions() {
   const days = Number(process.env.SESSION_DAYS || 7);
