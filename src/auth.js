@@ -696,20 +696,22 @@ router.get(
   "/google/callback",
   passport.authenticate("google", {
     failureRedirect: `${FRONTEND_BASE_URL}/beta`,
+    session: false,
   }),
   async (req, res) => {
     try {
       const userId = req.user.id;
+      const isBeta = String(req.query.state || "") === "beta";
 
-      // your existing session creation / login logic here
-
-      if (req.session.googleBetaSignup) {
+      if (isBeta) {
         await pool.query(
           `UPDATE users SET tier = 'Premium' WHERE id = $1`,
           [userId]
         );
-        delete req.session.googleBetaSignup;
       }
+
+      await getOrCreateUserMediaKey(userId);
+      await createSession(userId, res);
 
       return res.redirect(`${FRONTEND_BASE_URL}/watch`);
     } catch (e) {
