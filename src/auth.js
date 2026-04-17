@@ -682,13 +682,15 @@ router.post("/login", async (req, res) => {
   }
 });
 
-router.get(
-  "/google",
+router.get("/google", (req, res, next) => {
+  const isBeta = String(req.query.beta || "") === "1";
+
   passport.authenticate("google", {
     scope: ["profile", "email"],
     session: false,
-  })
-);
+    state: isBeta ? "beta" : "",
+  })(req, res, next);
+});
 
 router.get(
   "/google/callback",
