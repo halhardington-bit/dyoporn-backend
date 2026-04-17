@@ -691,34 +691,26 @@ router.get(
 router.get(
   "/google/callback",
   passport.authenticate("google", {
-    failureRedirect:
-      process.env.NODE_ENV === "production"
-        ? `${process.env.FRONTEND_BASE_URL}/?auth=google_failed`
-        : "http://localhost:5173/?auth=google_failed",
-    session: false,
+    failureRedirect: `${FRONTEND_BASE_URL}/beta`,
   }),
   async (req, res) => {
     try {
       const userId = req.user.id;
 
-      await getOrCreateUserMediaKey(userId);
-      await createSession(userId, res);
+      // your existing session creation / login logic here
 
-      const redirectTo =
-        process.env.NODE_ENV === "production"
-          ? `${process.env.FRONTEND_BASE_URL}/?auth=google_success`
-          : "http://localhost:5173/watch?auth=google_success";
+      if (req.session.googleBetaSignup) {
+        await pool.query(
+          `UPDATE users SET tier = 'Premium' WHERE id = $1`,
+          [userId]
+        );
+        delete req.session.googleBetaSignup;
+      }
 
-      return res.redirect(redirectTo);
-    } catch (err) {
-      console.error("Google callback session error:", err);
-
-      const redirectTo =
-        process.env.NODE_ENV === "production"
-          ? `${process.env.FRONTEND_BASE_URL}/?auth=google_failed`
-          : "http://localhost:5173/?auth=google_failed";
-
-      return res.redirect(redirectTo);
+      return res.redirect(`${FRONTEND_BASE_URL}/watch`);
+    } catch (e) {
+      console.error("Google callback error:", e);
+      return res.redirect(`${FRONTEND_BASE_URL}/beta`);
     }
   }
 );
