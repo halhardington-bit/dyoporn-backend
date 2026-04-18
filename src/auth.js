@@ -17,6 +17,7 @@ import {
 } from "./mailer.js";
 
 import { OAuth2Client } from "google-auth-library";
+import { reconcileExpiredPlanForUser } from "./billing.js";
 
 const router = express.Router();
 const googleTokenClient = new OAuth2Client();
@@ -177,6 +178,7 @@ async function getUserBySessionId(sessionId) {
       u.id,
       u.email,
       u.username,
+      u.email,
       u.tokens,
       u.rating,
       u.review_count,
@@ -667,6 +669,7 @@ router.post("/login", async (req, res) => {
     return res.json({
       id: user.id,
       username: user.username,
+      email: user.email,
       tokens: user.tokens,
       rating: user.rating,
       reviewCount: user.review_count,
@@ -720,6 +723,38 @@ router.get(
     }
   }
 );
+
+router.post("/cancel-plan", async (req, res) => {
+  const sid = req.cookies?.session_id;
+  if (!sid) return res.status(401).json({ error: "Not logged in" });
+
+  try {
+    const user = await getUserBySessionId(sid);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET plan_active = FALSE
+      WHERE id = $1
+        AND tier <> 'Free'
+      RETURNING tier, plan_active, plan_expiry
+      `,
+      [user.id]
+    );
+
+    return res.json({
+      ok: true,
+      message: "Subscription will remain active until the end of the billing period.",
+      tier: result.rows[0].tier,
+      planActive: !!result.rows[0].plan_active,
+      planExpiry: result.rows[0].plan_expiry,
+    });
+  } catch (err) {
+    console.error("Cancel plan error:", err);
+    return res.status(500).json({ error: "Failed to cancel subscription" });
+  }
+});
 
 router.post("/verify-email", async (req, res) => {
   const rawToken = String(req.body?.token || "").trim();
@@ -810,6 +845,65 @@ router.post("/resend-verification", async (req, res) => {
   }
 });
 
+router.post("/logout-all", async (req, res) => {
+  const sid = req.cookies?.session_id;
+  if (!sid) return res.status(401).json({ error: "Not logged in" });
+
+  try {
+    const user = await getUserBySessionId(sid);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+
+    await pool.query(
+      `
+      DELETE FROM sessions
+      WHERE user_id = $1
+      `,
+      [user.id]
+    );
+
+    res.clearCookie("session_id", cookieOptions());
+
+    return res.json({
+      ok: true,
+      message: "Logged out of all devices.",
+    });
+  } catch (err) {
+    console.error("Logout all error:", err);
+    return res.status(500).json({ error: "Failed to log out of all devices" });
+  }
+});
+
+router.post("/send-change-password-email", async (req, res) => {
+  const sid = req.cookies?.session_id;
+  if (!sid) return res.status(401).json({ error: "Not logged in" });
+
+  try {
+    const user = await getUserBySessionId(sid);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+
+    if (!user.email) {
+      return res.status(400).json({ error: "No email is associated with this account" });
+    }
+
+    await invalidateUnusedPasswordResetTokens(user.id);
+    const rawToken = await createPasswordResetToken(user.id);
+
+    await sendPasswordResetEmail({
+      email: user.email,
+      username: user.username,
+      rawToken,
+    });
+
+    return res.json({
+      ok: true,
+      message: "Password reset email sent.",
+    });
+  } catch (err) {
+    console.error("Send change password email error:", err);
+    return res.status(500).json({ error: "Failed to send password reset email" });
+  }
+});
+
 router.post("/logout", async (req, res) => {
   const sid = req.cookies?.session_id;
 
@@ -831,6 +925,7 @@ router.get("/me", async (req, res) => {
       SELECT
         u.id,
         u.username,
+        u.email,
         u.tokens,
         u.rating,
         u.review_count,
@@ -848,20 +943,51 @@ router.get("/me", async (req, res) => {
 
     if (!result.rows[0]) return res.status(401).json(null);
 
-    await getOrCreateUserMediaKey(result.rows[0].id);
+    await reconcileExpiredPlanForUser(result.rows[0].id);
+
+    const refreshed = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.email,
+        u.username,
+        u.tokens,
+        u.rating,
+        u.review_count,
+        u.email_verified,
+        u.is_moderator,
+        u.tier,
+        u.plan_active,
+        u.plan_expiry,
+        u.date_of_birth,
+        u.country
+      FROM users u
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [result.rows[0].id]
+    );
+
+    const u = refreshed.rows[0];
+
+    await getOrCreateUserMediaKey(u.id);
 
     return res.json({
-      id: result.rows[0].id,
-      username: result.rows[0].username,
-      tokens: result.rows[0].tokens,
-      rating: result.rows[0].rating,
-      reviewCount: result.rows[0].review_count,
-      isModerator: !!result.rows[0].is_moderator,
-      tier: result.rows[0].tier,
-      emailVerified: !!result.rows[0].email_verified,
-      dateOfBirth: result.rows[0].date_of_birth,
-      country: result.rows[0].country,
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      tokens: u.tokens,
+      rating: u.rating,
+      reviewCount: u.review_count,
+      isModerator: !!u.is_moderator,
+      tier: u.tier,
+      emailVerified: !!u.email_verified,
+      planActive: !!u.plan_active,
+      planExpiry: u.plan_expiry,
+      dateOfBirth: u.date_of_birth,
+      country: u.country,
     });
+
   } catch (err) {
     console.error("/me error:", err);
     return res.status(500).json({ error: "Failed to fetch current user" });

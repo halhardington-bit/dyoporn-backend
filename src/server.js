@@ -364,7 +364,15 @@ app.patch("/api/me/tier", requireAuth, async (req, res) => {
     await pool.query(
       `
       UPDATE users
-      SET tier = $2
+      SET
+        tier = $2,
+        plan_active = TRUE,
+        plan_expiry =
+          CASE
+            WHEN plan_expiry IS NOT NULL AND plan_expiry > now()
+              THEN date_trunc('hour', plan_expiry) + interval '1 month'
+            ELSE date_trunc('hour', now()) + interval '1 month'
+          END
       WHERE id = $1
       `,
       [userId, tier]
@@ -653,6 +661,78 @@ app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
   } catch (e) {
     console.error("GET /api/mod/reports error:", e);
     return res.status(500).json({ error: "Failed to load reports" });
+  }
+});
+
+app.post("/api/me/renew-plan", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET plan_active = TRUE
+      WHERE id = $1
+        AND tier <> 'Free'
+        AND plan_active = FALSE
+        AND plan_expiry IS NOT NULL
+        AND plan_expiry > now()
+      RETURNING tier, plan_active, plan_expiry
+      `,
+      [userId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(400).json({
+        error: "No cancelled active plan to renew",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message: "Subscription renewed. Auto-renewal is active again.",
+      tier: result.rows[0].tier,
+      planActive: !!result.rows[0].plan_active,
+      planExpiry: result.rows[0].plan_expiry,
+    });
+  } catch (e) {
+    console.error("POST /api/me/renew-plan error:", e);
+    return res.status(500).json({ error: "Failed to renew subscription" });
+  }
+});
+
+app.post("/api/me/cancel-plan", requireAuth, async (req, res) => {
+  const userId = Number(req.user.id);
+
+  try {
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET plan_active = FALSE
+      WHERE id = $1
+        AND tier <> 'Free'
+      RETURNING tier, plan_active, plan_expiry
+      `,
+      [userId]
+    );
+
+    if (!result.rows.length) {
+      return res.status(400).json({
+        error: "No active paid plan to cancel",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      message:
+        "Subscription cancelled. Your plan will remain active until the end of the billing period.",
+      tier: result.rows[0].tier,
+      planActive: !!result.rows[0].plan_active,
+      planExpiry: result.rows[0].plan_expiry,
+    });
+  } catch (e) {
+    console.error("POST /api/me/cancel-plan error:", e);
+    return res.status(500).json({ error: "Failed to cancel subscription" });
   }
 });
 
