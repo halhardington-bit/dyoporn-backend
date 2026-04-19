@@ -304,6 +304,7 @@ async function getUserFromSession(req) {
     u.tokens,
     u.email_verified,
     u.is_moderator,
+    u.is_banned,
     u.tier,
     COALESCE(AVG(vr.rating)::float, 0) AS rating,
     COALESCE(COUNT(vr.rating)::int, 0) AS review_count
@@ -325,6 +326,7 @@ async function getUserFromSession(req) {
     id: u.id,
     username: u.username,
     tokens: u.tokens,
+    isBanned: !!u.is_banned,
     rating: u.rating,
     isModerator: !!u.is_moderator,
     reviewCount: u.review_count,
@@ -350,7 +352,7 @@ async function requireAuth(req, res, next) {
   next();
 }
 
-app.patch("/api/me/tier", requireAuth, async (req, res) => {
+app.patch("/api/me/tier", requireAuth, requireNotBanned, async (req, res) => {
   const userId = Number(req.user.id);
   const tier = String(req.body?.tier || "").trim();
 
@@ -384,6 +386,16 @@ app.patch("/api/me/tier", requireAuth, async (req, res) => {
     return res.status(500).json({ error: "Failed to update tier" });
   }
 });
+
+async function requireNotBanned(req, res, next) {
+  const user = req.user ?? (await getUserFromSession(req));
+  if (!user) return res.status(401).json({ error: "Not logged in" });
+  if (user.isBanned) {
+    return res.status(403).json({ error: "This account has been banned." });
+  }
+  req.user = user;
+  next();
+}
 
 app.get("/system/latest-version.json", async (req, res) => {
   const channel = String(req.query.channel || "beta").trim().toLowerCase();
@@ -664,7 +676,200 @@ app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
   }
 });
 
-app.post("/api/me/renew-plan", requireAuth, async (req, res) => {
+app.get("/api/mod/users", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const filterBy = String(req.query.filterBy || "all");
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 50));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const values = [limit, offset];
+    let whereSql = "";
+
+    if (q) {
+      values.push(q);
+
+      if (filterBy === "id") {
+        whereSql = `WHERE CAST(u.id AS TEXT) ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "username") {
+        whereSql = `WHERE COALESCE(u.username, '') ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "email") {
+        whereSql = `WHERE COALESCE(u.email, '') ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "displayName") {
+        whereSql = `WHERE COALESCE(p.display_name, '') ILIKE '%' || $3 || '%'`;
+      } else {
+        whereSql = `
+          WHERE
+            CAST(u.id AS TEXT) ILIKE '%' || $3 || '%'
+            OR COALESCE(u.username, '') ILIKE '%' || $3 || '%'
+            OR COALESCE(u.email, '') ILIKE '%' || $3 || '%'
+            OR COALESCE(p.display_name, '') ILIKE '%' || $3 || '%'
+        `;
+      }
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.email,
+        COALESCE(p.display_name, '') AS "displayName",
+        u.tokens,
+        u.is_moderator AS "isModerator",
+        u.tier,
+        u.is_comment_shadowbanned AS "isCommentShadowbanned",
+        u.is_banned AS "isBanned",
+        COALESCE(rs.rating_avg, 0) AS "ratingAvg",
+        COALESCE(rs.rating_count, 0) AS "reviewCount"
+      FROM users u
+      LEFT JOIN user_profiles p
+        ON p.user_id = u.id
+      LEFT JOIN LATERAL (
+        SELECT
+          AVG(vr.rating)::numeric(10,2) AS rating_avg,
+          COUNT(*)::int AS rating_count
+        FROM videos v
+        JOIN video_ratings vr
+          ON vr.video_id::text = v.id::text
+        WHERE v.user_id = u.id
+      ) rs ON TRUE
+      ${whereSql}
+      ORDER BY u.id DESC
+      LIMIT $1 OFFSET $2
+      `,
+      values
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /api/mod/users failed", err);
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+app.get("/api/mod/users/:id", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.email,
+        COALESCE(p.display_name, '') AS "displayName",
+        u.tokens,
+        u.is_moderator AS "isModerator",
+        u.tier,
+        u.is_comment_shadowbanned AS "isCommentShadowbanned",
+        u.is_banned AS "isBanned",
+        COALESCE(rs.rating_avg, 0) AS "ratingAvg",
+        COALESCE(rs.rating_count, 0) AS "reviewCount"
+      FROM users u
+      LEFT JOIN user_profiles p
+        ON p.user_id = u.id
+      LEFT JOIN LATERAL (
+        SELECT
+          AVG(vr.rating)::numeric(10,2) AS rating_avg,
+          COUNT(*)::int AS rating_count
+        FROM videos v
+        JOIN video_ratings vr
+          ON vr.video_id::text = v.id::text
+        WHERE v.user_id = u.id
+      ) rs ON TRUE
+      WHERE u.id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("GET /api/mod/users/:id failed", err);
+    res.status(500).json({ error: "Failed to fetch user" });
+  }
+});
+
+app.patch("/api/mod/users/:id", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const userId = req.params.id;
+
+    let {
+      tokens,
+      tier,
+      isModerator,
+      isCommentShadowbanned,
+      isBanned,
+    } = req.body || {};
+
+    if (!Number.isFinite(Number(tokens)) || Number(tokens) < 0) {
+      return res.status(400).json({ error: "Invalid tokens" });
+    }
+
+    const allowedTiers = new Set(["Free", "Watcher", "Basic", "Premium"]);
+    if (!allowedTiers.has(String(tier || "Free"))) {
+      return res.status(400).json({ error: "Invalid plan" });
+    }
+
+    isModerator = Boolean(isModerator);
+    isCommentShadowbanned = Boolean(isCommentShadowbanned);
+    isBanned = Boolean(isBanned);
+
+    if (isBanned) {
+      tier = "Free";
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET
+        tokens = $2,
+        tier = $3,
+        is_moderator = $4,
+        is_comment_shadowbanned = $5,
+        is_banned = $6,
+        plan_active = CASE WHEN $6 THEN FALSE ELSE plan_active END,
+        plan_expiry = CASE WHEN $6 THEN NULL ELSE plan_expiry END
+      WHERE id = $1
+      RETURNING
+        id,
+        username,
+        email,
+        tokens,
+        is_moderator AS "isModerator",
+        tier,
+        is_comment_shadowbanned AS "isCommentShadowbanned",
+        is_banned AS "isBanned"
+      `,
+      [
+        userId,
+        Math.floor(Number(tokens)),
+        tier,
+        isModerator,
+        isCommentShadowbanned,
+        isBanned,
+      ]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /api/mod/users/:id failed", err);
+    res.status(500).json({ error: "Failed to update moderation user" });
+  }
+});
+
+
+
+app.post("/api/me/renew-plan", requireAuth, requireNotBanned, async (req, res) => {
   const userId = Number(req.user.id);
 
   try {
@@ -865,7 +1070,7 @@ const upload = multer({
 // Subscriptions
 // -------------------------
 
-app.post("/api/channels/:channelId/subscribe", requireVerifiedEmail, async (req, res) => {
+app.post("/api/channels/:channelId/subscribe", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   const subscriberId = Number(req.user.id);
   const channelId = Number(req.params.channelId);
 
@@ -1049,6 +1254,9 @@ function runCmd(cmd, args) {
   async function requireVerifiedEmail(req, res, next) {
     const user = req.user ?? (await getUserFromSession(req));
     if (!user) return res.status(401).json({ error: "Not logged in" });
+    if (user.isBanned) {
+      return res.status(403).json({ error: "This account has been banned." });
+    }
     if (!user.emailVerified) {
       return res.status(403).json({ error: "Please verify your email first" });
     }
@@ -1442,12 +1650,14 @@ registerGenerateProjects(app, {
   pool,
   requireAuth,
   requireVerifiedEmail,
+  requireNotBanned,
 });
 
 registerGeneratePublish(app, {
   pool,
   requireAuth,
   requireVerifiedEmail,
+  requireNotBanned,
   uploadFileToS3,
   VIDEO_SOURCE,
   VIDEO_DIR,
@@ -1637,7 +1847,7 @@ app.get("/api/me/watch-later/:videoId", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/me/watch-later/:videoId", requireVerifiedEmail, async (req, res) => {
+app.post("/api/me/watch-later/:videoId", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   const userId = Number(req.user.id);
   const videoId = String(req.params.videoId);
 
@@ -2189,7 +2399,7 @@ app.delete("/api/videos/:id", requireAuth, async (req, res) => {
   }
 });
 
-app.delete("/api/comments/:commentId", requireVerifiedEmail, async (req, res) => {
+app.delete("/api/comments/:commentId", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   const commentId = Number(req.params.commentId);
   const userId = Number(req.user.id);
 
@@ -2282,7 +2492,7 @@ app.patch("/api/comments/:commentId", requireAuth, async (req, res) => {
       UPDATE video_comments
       SET body = $2, updated_at = now()
       WHERE id = $1
-      RETURNING id, body, updated_at
+      RETURNING id, body, updated_at, is_shadow_hidden
       `,
       [commentId, body]
     );
@@ -2293,6 +2503,7 @@ app.patch("/api/comments/:commentId", requireAuth, async (req, res) => {
         id: Number(upd.rows[0].id),
         body: upd.rows[0].body,
         updatedAt: upd.rows[0].updated_at,
+        isShadowHidden: !!upd.rows[0].is_shadow_hidden,
       },
     });
   } catch (e) {
@@ -2309,11 +2520,9 @@ app.patch("/api/comments/:commentId", requireAuth, async (req, res) => {
 app.get("/api/videos/:videoId/comments", async (req, res) => {
   try {
     const videoId = req.params.videoId;
-
     const limit = Math.min(Number(req.query.limit || 50), 200);
     const offset = Math.max(Number(req.query.offset || 0), 0);
-
-    const myUserId = req.user?.id ?? null;
+    const myUserId = req.user?.id ? Number(req.user.id) : null;
 
     // top-level comments
     const top = await pool.query(
@@ -2325,6 +2534,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
         c.body,
         c.created_at,
         c.updated_at,
+        c.is_shadow_hidden,
         u.username,
         COALESCE(p.display_name, '') AS display_name,
         COALESCE(cls.like_count, 0) AS like_count,
@@ -2343,6 +2553,10 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
       LEFT JOIN comment_like_stats cls ON cls.comment_id = c.id
       WHERE c.video_id = $1
         AND c.parent_comment_id IS NULL
+        AND (
+          c.is_shadow_hidden = FALSE
+          OR ($3::bigint IS NOT NULL AND c.user_id = $3::bigint)
+        )
       ORDER BY c.created_at DESC
       LIMIT $2 OFFSET $4
       `,
@@ -2358,13 +2572,14 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
       body: r.body,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
+      isShadowHidden: !!r.is_shadow_hidden,
       likeCount: Number(r.like_count),
       likedByMe: !!r.liked_by_me,
       replies: [],
     }));
 
-    // one-level replies
     const parentIds = topItems.map((c) => c.id);
+
     if (parentIds.length) {
       const replies = await pool.query(
         `
@@ -2376,6 +2591,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
           c.body,
           c.created_at,
           c.updated_at,
+          c.is_shadow_hidden,
           u.username,
           COALESCE(p.display_name, '') AS display_name,
           COALESCE(cls.like_count, 0) AS like_count,
@@ -2394,12 +2610,17 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
         LEFT JOIN comment_like_stats cls ON cls.comment_id = c.id
         WHERE c.video_id = $1
           AND c.parent_comment_id = ANY($2::bigint[])
+          AND (
+            c.is_shadow_hidden = FALSE
+            OR ($3::bigint IS NOT NULL AND c.user_id = $3::bigint)
+          )
         ORDER BY c.created_at ASC
         `,
         [videoId, parentIds, myUserId]
       );
 
       const byParent = new Map();
+
       for (const r of replies.rows) {
         const pid = Number(r.parent_comment_id);
         if (!byParent.has(pid)) byParent.set(pid, []);
@@ -2412,6 +2633,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
           body: r.body,
           createdAt: r.created_at,
           updatedAt: r.updated_at,
+          isShadowHidden: !!r.is_shadow_hidden,
           likeCount: Number(r.like_count),
           likedByMe: !!r.liked_by_me,
         });
@@ -2429,10 +2651,10 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
   }
 });
 
-app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res) => {
+app.post("/api/videos/:videoId/comments", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   try {
     const videoId = req.params.videoId;
-    const userId = req.user.id;
+    const userId = Number(req.user.id);
 
     const body = String(req.body?.body || "").trim();
     const parentCommentId = req.body?.parentCommentId ?? null;
@@ -2440,11 +2662,26 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res)
     if (!body) return res.status(400).json({ error: "Comment body required" });
     if (body.length > 2000) return res.status(400).json({ error: "Comment too long" });
 
+    // load user's shadow-ban state
+    const userRes = await pool.query(
+      `
+      SELECT is_comment_shadowbanned
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
+      [userId]
+    );
+
+    const isShadowHidden = !!userRes.rows[0]?.is_comment_shadowbanned;
+
     // validate parent if provided (must be top-level comment on same video)
     let parentId = null;
     if (parentCommentId !== null && parentCommentId !== undefined && parentCommentId !== "") {
       const pid = Number(parentCommentId);
-      if (!Number.isFinite(pid)) return res.status(400).json({ error: "Bad parentCommentId" });
+      if (!Number.isFinite(pid)) {
+        return res.status(400).json({ error: "Bad parentCommentId" });
+      }
 
       const parent = await pool.query(
         `
@@ -2468,17 +2705,32 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res)
 
     const result = await pool.query(
       `
-      INSERT INTO video_comments (video_id, user_id, body, parent_comment_id)
-      VALUES ($1, $2, $3, $4)
-      RETURNING id, video_id, user_id, body, parent_comment_id, created_at, updated_at
+      INSERT INTO video_comments (
+        video_id,
+        user_id,
+        body,
+        parent_comment_id,
+        is_shadow_hidden
+      )
+      VALUES ($1, $2, $3, $4, $5)
+      RETURNING
+        id,
+        video_id,
+        user_id,
+        body,
+        parent_comment_id,
+        is_shadow_hidden,
+        created_at,
+        updated_at
       `,
-      [videoId, userId, body, parentId]
+      [videoId, userId, body, parentId, isShadowHidden]
     );
 
     const profile = await pool.query(
-      `SELECT COALESCE(display_name,'') AS display_name FROM user_profiles WHERE user_id = $1`,
+      `SELECT COALESCE(display_name, '') AS display_name FROM user_profiles WHERE user_id = $1`,
       [userId]
     );
+
     const displayName = profile.rows[0]?.display_name || req.user.username;
 
     res.json({
@@ -2493,6 +2745,7 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res)
         parentCommentId: result.rows[0].parent_comment_id
           ? Number(result.rows[0].parent_comment_id)
           : null,
+        isShadowHidden: !!result.rows[0].is_shadow_hidden,
         createdAt: result.rows[0].created_at,
         updatedAt: result.rows[0].updated_at,
         likeCount: 0,
@@ -2506,7 +2759,7 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, async (req, res)
   }
 });
 
-app.post("/api/comments/:commentId/toggle-like", requireVerifiedEmail, async (req, res) => {
+app.post("/api/comments/:commentId/toggle-like", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   const commentId = Number(req.params.commentId);
   const userId = req.user.id;
 
@@ -2611,7 +2864,7 @@ app.get("/api/videos/:id/my-rating", requireAuth, async (req, res) => {
   }
 });
 
-app.post("/api/videos/:id/rate", requireVerifiedEmail, async (req, res) => {
+app.post("/api/videos/:id/rate", requireVerifiedEmail, requireNotBanned, async (req, res) => {
   const videoId = String(req.params.id);
   const userId = String(req.user.id);
   const rating = Number(req.body.rating);
