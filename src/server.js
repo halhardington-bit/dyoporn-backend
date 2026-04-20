@@ -63,45 +63,6 @@ const allowedOrigins = new Set(
 );
 
 
-app.post("/api/account/delete/request", requireAuth, async (req, res) => {
-  try {
-    await requestDeleteEmailForUser(req.user.id);
-    res.json({
-      ok: true,
-      message: "A confirmation email has been sent. The link will expire shortly.",
-    });
-  } catch (err) {
-    console.error("delete request failed:", err);
-    res.status(500).json({ error: "Failed to send delete confirmation email." });
-  }
-});
-
-app.post("/api/account/delete/confirm", async (req, res) => {
-  try {
-    const { token, password } = req.body || {};
-
-    if (!token || !password) {
-      return res.status(400).json({ error: "Missing token or password." });
-    }
-
-    await confirmDeleteAccount({ token, password });
-
-    // optionally clear session cookie if one exists
-    res.clearCookie("session_id", {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: true,
-      path: "/",
-    });
-
-    return res.json({ ok: true });
-  } catch (err) {
-    console.error("delete confirm failed:", err);
-    return res.status(400).json({ error: err.message || "Failed to delete account." });
-  }
-});
-
-
 function makeAssetsS3Client() {
   const region =
     process.env.S3_ASSETS_REGION ||
@@ -374,6 +335,45 @@ async function getUserFromSession(req) {
     emailVerified: !!u.email_verified,
   };
 }
+
+
+app.post("/api/account/delete/request", requireAuth, async (req, res) => {
+  try {
+    await requestDeleteEmailForUser(req.user.id);
+    res.json({
+      ok: true,
+      message: "A confirmation email has been sent. The link will expire shortly.",
+    });
+  } catch (err) {
+    console.error("delete request failed:", err);
+    res.status(500).json({ error: "Failed to send delete confirmation email." });
+  }
+});
+
+app.post("/api/account/delete/confirm", async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+
+    if (!token || !password) {
+      return res.status(400).json({ error: "Missing token or password." });
+    }
+
+    await confirmDeleteAccount({ token, password });
+
+    // optionally clear session cookie if one exists
+    res.clearCookie("session_id", {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: true,
+      path: "/",
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("delete confirm failed:", err);
+    return res.status(400).json({ error: err.message || "Failed to delete account." });
+  }
+});
 
 // attach req.user early
 app.use(async (req, _res, next) => {
