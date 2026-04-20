@@ -22,6 +22,7 @@ import { registerGeneratePublish } from "./generatePublish.js";
 import { registerGenerateProjects } from "./generateProjects.js";
 import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 import { registerEndpointPublish } from "./EndpointPublish.js";
+import { requestDeleteEmailForUser, confirmDeleteAccount } from "./accountDelete.js";
 
 import passport from "passport";
 
@@ -60,6 +61,45 @@ const allowedOrigins = new Set(
     .map((s) => s.trim().replace(/\/$/, "")) // ✅ remove trailing slash
     .filter(Boolean)
 );
+
+
+app.post("/api/account/delete/request", requireAuth, async (req, res) => {
+  try {
+    await requestDeleteEmailForUser(req.user.id);
+    res.json({
+      ok: true,
+      message: "A confirmation email has been sent. The link will expire shortly.",
+    });
+  } catch (err) {
+    console.error("delete request failed:", err);
+    res.status(500).json({ error: "Failed to send delete confirmation email." });
+  }
+});
+
+app.post("/api/account/delete/confirm", async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+
+    if (!token || !password) {
+      return res.status(400).json({ error: "Missing token or password." });
+    }
+
+    await confirmDeleteAccount({ token, password });
+
+    // optionally clear session cookie if one exists
+    res.clearCookie("session_id", {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: true,
+      path: "/",
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("delete confirm failed:", err);
+    return res.status(400).json({ error: err.message || "Failed to delete account." });
+  }
+});
 
 
 function makeAssetsS3Client() {

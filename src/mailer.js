@@ -4,6 +4,54 @@ import { pool } from "./db.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+
+function getFrontendBase() {
+  const frontendBase = String(process.env.FRONTEND_BASE_URL || "").replace(/\/$/, "");
+  if (!frontendBase) throw new Error("Missing FRONTEND_BASE_URL");
+  return frontendBase;
+}
+
+function getEmailFrom() {
+  const from = process.env.EMAIL_FROM;
+  if (!from) throw new Error("Missing EMAIL_FROM");
+  return from;
+}
+
+export function makeDeleteToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+export function hashDeleteToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+export async function sendAccountDeleteEmail({ to, token }) {
+  const url = `${getFrontendBase()}/delete-account?token=${encodeURIComponent(token)}`;
+
+  await resend.emails.send({
+    from: getEmailFrom(),
+    to,
+    subject: "Confirm account deletion",
+    html: `
+      <div style="background:#0b0b0b;color:#f5f5f5;padding:24px;font-family:Arial,sans-serif;">
+        <h2 style="margin:0 0 12px;">Confirm account deletion</h2>
+        <p style="margin:0 0 12px;color:rgba(255,255,255,0.78);">
+          You requested to permanently delete your account.
+        </p>
+        <p style="margin:0 0 18px;color:rgba(255,255,255,0.78);">
+          This link is temporary and expires soon.
+        </p>
+        <a
+          href="${url}"
+          style="display:inline-block;padding:12px 18px;border-radius:12px;background:#d4af37;color:#111;text-decoration:none;font-weight:700;"
+        >
+          Confirm deletion
+        </a>
+      </div>
+    `,
+  });
+}
+
 export function hashToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
 }
