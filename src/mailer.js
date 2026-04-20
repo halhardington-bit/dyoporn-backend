@@ -4,17 +4,12 @@ import { pool } from "./db.js";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-
-function getFrontendBase() {
-  const frontendBase = String(process.env.FRONTEND_BASE_URL || "").replace(/\/$/, "");
-  if (!frontendBase) throw new Error("Missing FRONTEND_BASE_URL");
-  return frontendBase;
+export function hashToken(token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
 }
 
-function getEmailFrom() {
-  const from = process.env.EMAIL_FROM;
-  if (!from) throw new Error("Missing EMAIL_FROM");
-  return from;
+export function makeVerificationToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
 export function makeDeleteToken() {
@@ -23,41 +18,6 @@ export function makeDeleteToken() {
 
 export function hashDeleteToken(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-export async function sendAccountDeleteEmail({ to, token }) {
-  const url = `${getFrontendBase()}/delete-account?token=${encodeURIComponent(token)}`;
-
-  await resend.emails.send({
-    from: getEmailFrom(),
-    to,
-    subject: "Confirm account deletion",
-    html: `
-      <div style="background:#0b0b0b;color:#f5f5f5;padding:24px;font-family:Arial,sans-serif;">
-        <h2 style="margin:0 0 12px;">Confirm account deletion</h2>
-        <p style="margin:0 0 12px;color:rgba(255,255,255,0.78);">
-          You requested to permanently delete your account.
-        </p>
-        <p style="margin:0 0 18px;color:rgba(255,255,255,0.78);">
-          This link is temporary and expires soon.
-        </p>
-        <a
-          href="${url}"
-          style="display:inline-block;padding:12px 18px;border-radius:12px;background:#d4af37;color:#111;text-decoration:none;font-weight:700;"
-        >
-          Confirm deletion
-        </a>
-      </div>
-    `,
-  });
-}
-
-export function hashToken(token) {
-  return crypto.createHash("sha256").update(token).digest("hex");
-}
-
-export function makeVerificationToken() {
-  return crypto.randomBytes(32).toString("hex");
 }
 
 function getFrontendBase() {
@@ -131,7 +91,6 @@ function buildEmailTemplate({
     >
       <tr>
         <td align="center" style="padding:32px 16px;" bgcolor="#0f0f10">
-
           <table
             role="presentation"
             cellpadding="0"
@@ -142,7 +101,6 @@ function buildEmailTemplate({
           >
             <tr>
               <td align="center">
-
                 <table
                   role="presentation"
                   cellpadding="0"
@@ -305,11 +263,9 @@ function buildEmailTemplate({
                 >
                   ${safeFooter}
                 </p>
-
               </td>
             </tr>
           </table>
-
         </td>
       </tr>
     </table>
@@ -460,6 +416,44 @@ export async function sendPasswordResetEmail({ email, username, rawToken }) {
     `This link expires in ${hours} hour${hours === 1 ? "" : "s"}.`,
     "",
     "If you didn’t request a password reset, you can safely ignore this email.",
+  ].join("\n");
+
+  return sendEmail({
+    to: email,
+    subject,
+    html,
+    text,
+  });
+}
+
+export async function sendAccountDeleteEmail({ email, username, rawToken }) {
+  const frontendBase = getFrontendBase();
+  const deleteUrl = `${frontendBase}/delete-account?token=${encodeURIComponent(rawToken)}`;
+  const minutes = Number(process.env.ACCOUNT_DELETE_MINUTES || 15);
+
+  const subject = "Confirm account deletion";
+
+  const html = buildEmailTemplate({
+    eyebrow: "DYOP",
+    title: "Confirm account deletion",
+    intro: `Hi ${username || "there"}, you requested to permanently delete your account. This action cannot be undone.`,
+    actionLabel: "Confirm Deletion",
+    actionUrl: deleteUrl,
+    hoursText: `This link expires in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+    footer: "If you didn’t request account deletion, you can safely ignore this email.",
+  });
+
+  const text = [
+    "Confirm account deletion",
+    "",
+    `Hi ${username || "there"},`,
+    "",
+    "Use the link below to continue deleting your account:",
+    deleteUrl,
+    "",
+    `This link expires in ${minutes} minute${minutes === 1 ? "" : "s"}.`,
+    "",
+    "If you didn’t request account deletion, you can safely ignore this email.",
   ].join("\n");
 
   return sendEmail({
