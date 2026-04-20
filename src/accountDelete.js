@@ -74,18 +74,37 @@ function deriveExtraVideoKeys(video) {
 
 export async function requestDeleteEmailForUser(userId) {
   const client = await pool.connect();
+
   try {
     const userRes = await client.query(
-      `SELECT id, email FROM users WHERE id = $1 LIMIT 1`,
+      `
+      SELECT id, email, username
+      FROM users
+      WHERE id = $1
+      LIMIT 1
+      `,
       [userId]
     );
 
     const user = userRes.rows[0];
-    if (!user) throw new Error("User not found.");
+    if (!user) {
+      throw new Error("User not found.");
+    }
+
+    // optional: invalidate older unused tokens first
+    await client.query(
+      `
+      DELETE FROM account_delete_tokens
+      WHERE user_id = $1
+        AND used_at IS NULL
+      `,
+      [user.id]
+    );
 
     const token = makeDeleteToken();
     const tokenHash = hashDeleteToken(token);
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
+    const minutes = Number(process.env.ACCOUNT_DELETE_MINUTES || 15);
+    const expiresAt = new Date(Date.now() + minutes * 60 * 1000);
 
     await client.query(
       `
@@ -96,8 +115,9 @@ export async function requestDeleteEmailForUser(userId) {
     );
 
     await sendAccountDeleteEmail({
-      to: user.email,
-      token,
+      email: user.email,
+      username: user.username,
+      rawToken: token,
     });
   } finally {
     client.release();
