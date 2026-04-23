@@ -1640,6 +1640,47 @@ function filterOutSeenVideos(rows = [], seenIds = new Set()) {
   return out;
 }
 
+function normTag(t) {
+  return String(t || "").trim().toLowerCase();
+}
+
+function titleTag(t) {
+  const s = String(t || "").trim();
+  if (!s) return "Other";
+  return s
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((w) => w[0].toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+function buildRowsByTags(videos, { maxRows = 6, minCount = 2 } = {}) {
+  const counts = new Map();
+
+  for (const v of videos) {
+    const tags = Array.isArray(v.tags) ? v.tags : [];
+    for (const raw of tags) {
+      const t = normTag(raw);
+      if (!t) continue;
+      counts.set(t, (counts.get(t) || 0) + 1);
+    }
+  }
+
+  const topTags = [...counts.entries()]
+    .filter(([, c]) => c >= minCount)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, maxRows)
+    .map(([t]) => t);
+
+  return topTags.map((tag) => ({
+    key: `tag:${tag}`,
+    title: titleTag(tag),
+    videos: videos.filter((v) =>
+      (Array.isArray(v.tags) ? v.tags : []).some((x) => normTag(x) === tag)
+    ),
+  }));
+}
+
 async function buildHomeRow({
   req,
   key,
@@ -1947,7 +1988,7 @@ app.get("/api/home", async (req, res) => {
 
     if (userId) {
       context = await getUserPreferences(userId);
-}
+    }
 
     console.log("[/api/home] start", { userId });
 
@@ -2131,7 +2172,7 @@ app.get("/api/home", async (req, res) => {
     }
 
     // -------------------------
-    // Trending
+    // Trending (last 2 days only)
     // -------------------------
     {
       const trendingRows = await pool.query(
@@ -2160,7 +2201,7 @@ app.get("/api/home", async (req, res) => {
         WHERE v.visibility = 'public'
           AND v.asset_scope = 'public'
           AND v.media_type = 'video'
-          AND v.created_at >= now() - interval '14 days'
+          AND v.created_at >= now() - interval '2 days'
         ORDER BY v.views DESC NULLS LAST, v.created_at DESC
         LIMIT 16
         `
@@ -2176,6 +2217,61 @@ app.get("/api/home", async (req, res) => {
       });
 
       if (row) rows.push(row);
+    }
+
+    // -------------------------
+    // Browse by Tag (older than 2 days)
+    // -------------------------
+    {
+      const olderTagSource = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+          AND v.created_at < now() - interval '2 days'
+        ORDER BY v.views DESC NULLS LAST, v.created_at DESC
+        LIMIT 200
+        `
+      );
+
+      const tagRows = buildRowsByTags(olderTagSource.rows, {
+        maxRows: 6,
+        minCount: 2,
+      });
+
+      for (const tagRow of tagRows) {
+        const built = await buildHomeRow({
+          req,
+          key: tagRow.key,
+          title: tagRow.title,
+          dbRows: tagRow.videos,
+          seenIds,
+          minVideos: 4,
+        });
+
+        if (built) rows.push(built);
+      }
     }
 
     // -------------------------
