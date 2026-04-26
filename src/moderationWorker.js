@@ -148,27 +148,24 @@ function buildModerationPayload(video) {
         gender: identity.gender || null,
         age_bracket: identity.age_bracket || null,
         fantasy_race: identity.fantasy_race || null,
-        facial_archetype: identity.facial_archetype || null,
-        voice_name: identity.voice_name || null,
-        voice_category: identity.voice_category || null,
-        clothing_prompt: styling.clothing_prompt || null,
-        negative_prompt: styling.negative_prompt || null,
-        custom_prompt: styling.catch_all_custom || null,
-        activated_loras: Array.isArray(item.activated_loras)
-          ? item.activated_loras
-          : [],
-        physical_attributes: item.physical_attributes || null,
-        compiled_positive_prompt: item.compiled_positive_prompt || null,
-        compiled_base_positive_prompt: item.compiled_base_positive_prompt || null,
-      });
+
+        // ✅ trim smaller fields lightly
+        clothing_prompt: truncate(styling.clothing_prompt, 300),
+        negative_prompt: truncate(styling.negative_prompt, 300),
+        custom_prompt: truncate(styling.catch_all_custom, 300),
+
+        // 🔥 trim BIG fields aggressively
+        compiled_positive_prompt: truncate(item.compiled_positive_prompt, 800),
+        compiled_base_positive_prompt: truncate(item.compiled_base_positive_prompt, 800),
+        });
 
       if (item.compiled_positive_prompt) {
-        prompts.push(item.compiled_positive_prompt);
-      }
+        prompts.push(truncate(item.compiled_positive_prompt, 800));
+        }
 
       if (item.compiled_base_positive_prompt) {
-        prompts.push(item.compiled_base_positive_prompt);
-      }
+        prompts.push(truncate(item.compiled_base_positive_prompt, 800));
+        }
 
       if (Array.isArray(item.activated_loras)) {
         for (const lora of item.activated_loras) {
@@ -211,8 +208,8 @@ function buildModerationPayload(video) {
     },
     pipeline: data.pipeline || null,
     declared_moderation: data.moderation || null,
-    characters,
-    prompts: [...new Set(prompts)].slice(0, 80),
+    characters: characters.slice(0, 3),
+    prompts: [...new Set(prompts)].slice(0, 0),
     activated_loras: [...loras],
     asset_names: [...assetNames].slice(0, 300),
     source_urls: [...sourceUrls].slice(0, 300),
@@ -231,6 +228,11 @@ function buildModerationPayload(video) {
       "sexualized_youthful_character",
     ],
   };
+}
+
+function truncate(str, max = 500) {
+  if (!str) return str;
+  return str.length > max ? str.slice(0, max) : str;
 }
 
 async function saveModerationResult(videoId, result) {
