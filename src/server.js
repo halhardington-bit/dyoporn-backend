@@ -631,14 +631,17 @@ app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
     if (q) {
       where.push(`
         (
-          CAST(v.id AS text) ILIKE $${i}
-          OR v.title ILIKE $${i}
-          OR CAST(v.user_id AS text) ILIKE $${i}
-          OR u.username ILIKE $${i}
+          CAST(r.video_id AS text) ILIKE $${i}
+          OR COALESCE(v.title, r.video_title_snapshot, '') ILIKE $${i}
+          OR CAST(COALESCE(v.user_id, r.subject_user_id) AS text) ILIKE $${i}
+          OR COALESCE(u.username, '') ILIKE $${i}
           OR COALESCE(p.display_name, '') ILIKE $${i}
           OR CAST(r.reporter_id AS text) ILIKE $${i}
           OR r.offense ILIKE $${i}
           OR COALESCE(r.comments, '') ILIKE $${i}
+          OR COALESCE(r.source, '') ILIKE $${i}
+          OR COALESCE(r.severity, '') ILIKE $${i}
+          OR COALESCE(r.auto_action, '') ILIKE $${i}
         )
       `);
       params.push(`%${q}%`);
@@ -661,18 +664,23 @@ app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
         r.addressed_at,
         r.created_at,
 
-        v.title AS video_title,
+        COALESCE(v.title, r.video_title_snapshot, 'Deleted video') AS video_title,
         v.visibility,
-        v.user_id AS video_owner_id,
+        COALESCE(v.user_id, r.subject_user_id) AS video_owner_id,
 
         u.username AS channel_username,
         COALESCE(p.display_name, '') AS channel_display_name,
 
         ru.username AS reporter_username,
-        COALESCE(rp.display_name, '') AS reporter_display_name
+        COALESCE(rp.display_name, '') AS reporter_display_name,
+
+        r.source,
+        r.severity,
+        r.auto_action
+
       FROM video_reports r
-      JOIN videos v ON v.id::text = r.video_id::text
-      JOIN users u ON u.id = v.user_id
+      LEFT JOIN videos v ON v.id::text = r.video_id::text
+      LEFT JOIN users u ON u.id = COALESCE(v.user_id, r.subject_user_id)
       LEFT JOIN user_profiles p ON p.user_id = u.id
       LEFT JOIN users ru ON ru.id = r.reporter_id
       LEFT JOIN user_profiles rp ON rp.user_id = ru.id
@@ -708,6 +716,10 @@ app.get("/api/mod/reports", requireAuth, requireModerator, async (req, res) => {
         actionTaken: row.action_taken || null,
         createdAt: row.created_at,
         addressedAt: row.addressed_at,
+
+        source: row.source || null,
+        severity: row.severity || null,
+        autoAction: row.auto_action || null,
       }))
     );
   } catch (e) {
@@ -3191,22 +3203,8 @@ app.post("/api/videos/:id/report", requireAuth, async (req, res) => {
   const offense = String(req.body?.offense || "").trim();
   const comments = String(req.body?.comments || "").trim();
 
-  const allowedOffenses = new Set([
-    "Spam or misleading",
-    "Harassment or bullying",
-    "Hateful or abusive content",
-    "Violence or dangerous acts",
-    "Sexual content",
-    "Copyright or stolen content",
-    "Other",
-  ]);
-
   if (!videoId) {
     return res.status(400).json({ error: "Missing video id" });
-  }
-
-  if (!allowedOffenses.has(offense)) {
-    return res.status(400).json({ error: "Invalid report reason" });
   }
 
   if (comments.length > 2000) {

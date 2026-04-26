@@ -8,6 +8,146 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const REPORT_MEDIUM = String(process.env.MODERATION_REPORT_MEDIUM ?? "true") === "true";
+
+function severityRank(severity) {
+  const s = String(severity || "none").toLowerCase();
+  return {
+    none: 0,
+    low: 1,
+    medium: 2,
+    high: 3,
+    extreme: 4,
+    critical: 4,
+  }[s] ?? 0;
+}
+
+function normalizeModerationResult(result) {
+  const categories = Array.isArray(result.categories) ? result.categories : [];
+
+  let severity = String(result.severity || "none").toLowerCase();
+
+  const copyrightLike = categories.some((c) =>
+    [
+      "copyright",
+      "trademark",
+      "brand_or_logo",
+      "existing_character",
+      "existing_franchise",
+      "music_or_artist",
+    ].includes(c)
+  );
+
+  if (copyrightLike && severityRank(severity) < severityRank("high")) {
+    severity = "high";
+  }
+
+  return {
+    ...result,
+    severity,
+  };
+}
+
+async function createAutoModerationReport({ video, result, autoAction }) {
+  const offense = `Automated moderation: ${result.severity}`;
+
+  const comments = [
+    `Auto action: ${autoAction}`,
+    `Recommended action: ${result.recommended_action || "unknown"}`,
+    `Categories: ${(result.categories || []).join(", ") || "none"}`,
+    `Reason: ${result.reason || "No reason provided."}`,
+    `Flagged terms: ${(result.flagged_terms || []).join(", ") || "none"}`,
+  ].join("\n\n");
+
+  await pool.query(
+    `
+    INSERT INTO video_reports (
+      video_id,
+      reporter_id,
+      offense,
+      comments,
+      source,
+      severity,
+      auto_action,
+      subject_user_id,
+      video_title_snapshot,
+      moderation_result
+    )
+    VALUES ($1, NULL, $2, $3, 'auto_moderation', $4, $5, $6, $7, $8::jsonb)
+    `,
+    [
+      autoAction === "deleted" ? null : String(video.id),
+      offense,
+      comments,
+      result.severity,
+      autoAction,
+      video.user_id || null,
+      video.title || null,
+      JSON.stringify(result),
+    ]
+  );
+}
+
+async function shadowBanVideo(videoId) {
+  await pool.query(
+    `
+    UPDATE videos
+    SET visibility = 'private',
+        updated_at = NOW()
+    WHERE id::text = $1::text
+    `,
+    [String(videoId)]
+  );
+}
+
+async function deleteVideoRecord(videoId) {
+  await pool.query(
+    `
+    DELETE FROM videos
+    WHERE id::text = $1::text
+    `,
+    [String(videoId)]
+  );
+}
+
+async function applyModerationActions(video, rawResult) {
+  const result = normalizeModerationResult(rawResult);
+  const rank = severityRank(result.severity);
+
+  if (rank >= severityRank("extreme")) {
+    await createAutoModerationReport({
+      video,
+      result,
+      autoAction: "deleted",
+    });
+
+    await deleteVideoRecord(video.id);
+    return result;
+  }
+
+  if (rank >= severityRank("high")) {
+    await shadowBanVideo(video.id);
+
+    await createAutoModerationReport({
+      video,
+      result,
+      autoAction: "shadow_banned",
+    });
+
+    return result;
+  }
+
+  if (rank >= severityRank("medium") && REPORT_MEDIUM) {
+    await createAutoModerationReport({
+      video,
+      result,
+      autoAction: "reported_only",
+    });
+  }
+
+  return result;
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -25,7 +165,7 @@ async function claimNextVideo() {
       FOR UPDATE SKIP LOCKED
       LIMIT 1
     )
-    RETURNING id, title, description, tags, creation_data;
+    RETURNING id, user_id, title, description, tags, creation_data;
   `);
 
   return rows[0] || null;
@@ -48,6 +188,12 @@ Your job is to detect:
 - impersonation or likeness misuse
 - explicit requests to recreate existing films, shows, games, characters, brands, studios, logos, songs, artists, or protected franchises
 - unsafe or policy-breaking generation instructions
+
+Classify copyright, trademark, existing franchise, existing character, or music/artist infringement as high severity at minimum.
+Classify any detected non-fictional people as high severity
+
+Use extreme only for content that should be removed immediately.
+Do not use "allowed offenses". Any detected offense can be reported.
 
 Be conservative but not hysterical.
 Do not invent facts.
@@ -73,7 +219,7 @@ Return JSON only.
             passed: { type: "boolean" },
             severity: {
               type: "string",
-              enum: ["none", "low", "medium", "high", "critical"],
+              enum: ["none", "low", "medium", "high", "extreme"],
             },
             categories: {
               type: "array",
@@ -291,19 +437,22 @@ async function processOneVideo() {
   console.log(`[moderation] Claimed video ${video.id}`);
 
   try {
-    const result = await moderateCreationData(video);
+    const rawResult = await moderateCreationData(video);
+    const result = await applyModerationActions(video, rawResult);
 
+    if (severityRank(result.severity) < severityRank("extreme")) {
     await saveModerationResult(video.id, result);
+    }
 
-    console.log(
-      `[moderation] Completed video ${video.id}: ${result.recommended_action} / ${result.severity}`
-    );
-  } catch (err) {
-    console.error(`[moderation] Failed video ${video.id}`, err);
-    await markAsFailedButChecked(video.id, err);
-  }
+        console.log(
+        `[moderation] Completed video ${video.id}: ${result.recommended_action} / ${result.severity}`
+        );
+    } catch (err) {
+        console.error(`[moderation] Failed video ${video.id}`, err);
+        await markAsFailedButChecked(video.id, err);
+    }
 
-  return true;
+    return true;
 }
 
 async function main() {
