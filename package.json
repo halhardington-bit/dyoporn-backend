@@ -4,7 +4,9 @@
   "type": "module",
   "scripts": {
     "dev": "node src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "moderation": "node src/moderationWorker.js"
+    
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.989.0",
@@ -18,10 +20,12 @@
     "hls.js": "^1.6.15",
     "morgan": "^1.10.1",
     "multer": "^2.0.2",
+    "openai": "^6.34.0",
     "passport": "^0.7.0",
     "passport-google-oauth20": "^2.0.0",
     "pg": "^8.18.0",
     "resend": "^6.9.4",
     "uuid": "^9.0.1"
   }
+  
 }
