@@ -26,6 +26,8 @@ import { requestDeleteEmailForUser, confirmDeleteAccount } from "./accountDelete
 
 import passport from "passport";
 
+import geoip from "geoip-lite";
+
 
 // ✅ S3 helpers (single import, consistent exports)
 import {
@@ -120,6 +122,41 @@ async function uploadFileToAssetsBucket({ assetsS3, bucket, key, filePath, conte
       CacheControl: "public, max-age=31536000, immutable",
     })
   );
+}
+
+function getClientIp(req) {
+  return (
+    req.headers["cf-connecting-ip"] ||
+    req.headers["x-real-ip"] ||
+    req.headers["x-forwarded-for"]?.split(",")[0]?.trim() ||
+    req.socket.remoteAddress
+  );
+}
+
+function requireAustralia(req, res, next) {
+  const ip = getClientIp(req);
+
+  // Let local dev through
+  if (
+    ip === "::1" ||
+    ip === "127.0.0.1" ||
+    ip?.startsWith("::ffff:127.") ||
+    ip?.startsWith("192.168.") ||
+    ip?.startsWith("10.")
+  ) {
+    return next();
+  }
+
+  const geo = geoip.lookup(ip);
+
+  if (!geo || geo.country !== "AU") {
+    return res.status(403).json({
+      error: "This service is only available in Australia.",
+      code: "REGION_BLOCKED",
+    });
+  }
+
+  next();
 }
 
 function scoreVideo(v, context) {
@@ -257,7 +294,16 @@ app.options(/.*/, cors(corsOptions));
 app.use(morgan("dev"));
 app.use(express.json());
 app.use(cookieParser());
+
 app.use(passport.initialize());
+if (process.env.ENABLE_AU_GEOFENCE === "1") {
+  console.log("🇦🇺 Australia geofence ENABLED");
+
+  app.use("/api", requireAustralia);
+  app.use("/auth", requireAustralia);
+} else {
+  console.log("🌍 Australia geofence DISABLED");
+}
 
 // -------------------------
 // Paths / storage

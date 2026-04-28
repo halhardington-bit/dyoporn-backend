@@ -15,6 +15,7 @@
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",
     "express": "^4.22.1",
+    "geoip-lite": "^2.0.1",
     "google-auth-library": "^10.6.2",
     "hls.js": "^1.6.15",
     "morgan": "^1.10.1",
