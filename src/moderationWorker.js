@@ -195,6 +195,7 @@ Your job is ONLY to detect the following violations:
 1. Copyright or trademark infringement
    - Recreating existing characters, franchises, brands, studios, logos, songs, or artists
    - Direct references to known IP (movies, games, anime, etc.)
+   - These videos are to be classified in the medium severity. 
 
 2. Real people usage
    - Any real person, celebrity, influencer, politician, or identifiable individual
@@ -231,9 +232,11 @@ Sexual content MUST NOT affect severity by itself.
 
 Only escalate severity if sexual content involves:
 
+MEDIUM Severity:
+- Copyrighted or trademarked characters or franchises. Copyrighted characters are protected by the first ammendment as a form of parody but should still be reported just in case
+
 HIGH severity:
 - Real people (celebrity or identifiable individuals)
-- Copyrighted or trademarked characters or franchises
 
 EXTREME severity:
 - Clear indication of minors or underage individuals in a sexual context
@@ -271,7 +274,7 @@ SEVERITY RULES:
 ADDITIONAL RULES:
 
 If categories include ANY of:
-copyright, trademark, brand_or_logo, existing_character, existing_franchise, music_or_artist
+brand_or_logo, existing music_or_artist
 
 → severity MUST be at least "high"
 

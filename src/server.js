@@ -296,14 +296,6 @@ app.use(express.json());
 app.use(cookieParser());
 
 app.use(passport.initialize());
-if (process.env.ENABLE_AU_GEOFENCE === "1") {
-  console.log("🇦🇺 Australia geofence ENABLED");
-
-  app.use("/api", blockAustralia);
-  app.use("/auth", blockAustralia);
-} else {
-  console.log("🌍 Australia geofence DISABLED");
-}
 
 // -------------------------
 // Paths / storage
@@ -482,6 +474,29 @@ async function requireNotBanned(req, res, next) {
   req.user = user;
   next();
 }
+
+app.get("/api/region-check", (req, res) => {
+  const enabled = process.env.ENABLE_AU_GEOFENCE === "1";
+
+  if (!enabled) {
+    return res.json({
+      enabled: false,
+      isAustralia: false,
+      country: null,
+    });
+  }
+
+  const ip = getClientIp(req);
+  const geo = geoip.lookup(ip);
+
+  const isAustralia = geo?.country === "AU";
+
+  return res.json({
+    enabled: true,
+    isAustralia,
+    country: geo?.country || null,
+  });
+});
 
 app.get("/system/latest-version.json", async (req, res) => {
   const channel = String(req.query.channel || "beta").trim().toLowerCase();
