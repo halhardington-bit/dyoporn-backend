@@ -133,7 +133,7 @@ function getClientIp(req) {
   );
 }
 
-function requireAustralia(req, res, next) {
+function blockAustralia(req, res, next) {
   const ip = getClientIp(req);
 
   // Let local dev through
@@ -149,9 +149,9 @@ function requireAustralia(req, res, next) {
 
   const geo = geoip.lookup(ip);
 
-  if (!geo || geo.country !== "AU") {
+ if (geo?.country === "AU") {
     return res.status(403).json({
-      error: "This service is only available in Australia.",
+      error: "This service is not available in Australia.",
       code: "REGION_BLOCKED",
     });
   }
@@ -299,8 +299,8 @@ app.use(passport.initialize());
 if (process.env.ENABLE_AU_GEOFENCE === "1") {
   console.log("🇦🇺 Australia geofence ENABLED");
 
-  app.use("/api", requireAustralia);
-  app.use("/auth", requireAustralia);
+  app.use("/api", blockAustralia);
+  app.use("/auth", blockAustralia);
 } else {
   console.log("🌍 Australia geofence DISABLED");
 }
