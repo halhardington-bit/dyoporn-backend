@@ -83,6 +83,58 @@ function makeAssetsS3Client() {
   });
 }
 
+function hasPaidTier(user) {
+  return user?.tier && user.tier !== "Free";
+}
+
+async function hasFreeGrant(userId, videoId) {
+  if (!userId) return false;
+
+  const result = await pool.query(
+    `
+    SELECT 1
+    FROM free_video_grants
+    WHERE user_id = $1
+      AND video_id::text = $2::text
+      AND expires_at > NOW()
+    LIMIT 1
+    `,
+    [userId, String(videoId)]
+  );
+
+  return result.rowCount > 0;
+}
+
+async function grantFreeRowVideos(userId, rows) {
+  if (!userId) return;
+
+  const freeVideoIds = [];
+
+  for (const row of rows) {
+    const firstTwo = Array.isArray(row.videos) ? row.videos.slice(0, 2) : [];
+
+    for (const video of firstTwo) {
+      if (video?.id) freeVideoIds.push(String(video.id));
+    }
+  }
+
+  const uniqueIds = [...new Set(freeVideoIds)];
+
+  for (const videoId of uniqueIds) {
+    await pool.query(
+      `
+      INSERT INTO free_video_grants (user_id, video_id, expires_at)
+      VALUES ($1, $2, NOW() + INTERVAL '24 hours')
+      ON CONFLICT (user_id, video_id)
+      DO UPDATE SET
+        granted_at = NOW(),
+        expires_at = NOW() + INTERVAL '24 hours'
+      `,
+      [userId, videoId]
+    );
+  }
+}
+
 async function retry(fn, { attempts = 2, delayMs = 500 } = {}) {
   let lastErr;
 
@@ -1762,7 +1814,7 @@ async function buildHomeRow({
   seenIds,
   minVideos = 1,
   allowDuplicates = false,
-  limit = 12,
+  limit = 6,
   context = null, // 👈 NEW
 }) {
   const uniqueRows = uniqueById(dbRows);
@@ -2057,6 +2109,9 @@ app.get("/api/home", async (req, res) => {
     const rows = [];
     const seenIds = new Set();
 
+    const ROW_LIMIT = 6;
+    const FINAL_ROW_LIMIT = 12;
+
     let context = null;
 
     if (userId) {
@@ -2064,6 +2119,18 @@ app.get("/api/home", async (req, res) => {
     }
 
     console.log("[/api/home] start", { userId });
+
+    async function addRow(config) {
+      const row = await buildHomeRow({
+        req,
+        seenIds,
+        limit: ROW_LIMIT,
+        ...config,
+      });
+
+      if (row) rows.push(row);
+      return row;
+    }
 
     // -------------------------
     // Continue Watching
@@ -2101,22 +2168,18 @@ app.get("/api/home", async (req, res) => {
           AND v.asset_scope = 'public'
           AND v.media_type = 'video'
         ORDER BY wh.watched_at DESC
-        LIMIT 12
+        LIMIT 24
         `,
         [userId]
       );
 
-      const row = await buildHomeRow({
-        req,
+      await addRow({
         key: "continue-watching",
         title: "Continue Watching",
         dbRows: continueRows.rows,
-        seenIds,
         minVideos: 1,
         context,
       });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
@@ -2152,21 +2215,17 @@ app.get("/api/home", async (req, res) => {
           AND v.asset_scope = 'public'
           AND v.media_type = 'video'
         ORDER BY v.created_at DESC
-        LIMIT 16
+        LIMIT 24
         `,
         [userId]
       );
 
-      const row = await buildHomeRow({
-        req,
+      await addRow({
         key: "from-subscriptions",
         title: "From Your Subscriptions",
         dbRows: subscriptionRows.rows,
-        seenIds,
-        minVideos: 4,
+        minVideos: 2,
       });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
@@ -2227,25 +2286,21 @@ app.get("/api/home", async (req, res) => {
               AND wh.video_id::text = v.id::text
           )
         ORDER BY v.views DESC NULLS LAST, v.created_at DESC
-        LIMIT 16
+        LIMIT 24
         `,
         [userId]
       );
 
-      const row = await buildHomeRow({
-        req,
+      await addRow({
         key: "based-on-ratings",
         title: "Because You Rated Similar Videos",
         dbRows: ratedTagRows.rows,
-        seenIds,
-        minVideos: 4,
+        minVideos: 2,
       });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
-    // Trending (last 2 days only)
+    // Trending
     // -------------------------
     {
       const trendingRows = await pool.query(
@@ -2276,24 +2331,64 @@ app.get("/api/home", async (req, res) => {
           AND v.media_type = 'video'
           AND v.created_at >= now() - interval '2 days'
         ORDER BY v.views DESC NULLS LAST, v.created_at DESC
-        LIMIT 16
+        LIMIT 24
         `
       );
 
-      const row = await buildHomeRow({
-        req,
+      await addRow({
         key: "trending",
         title: "Trending",
         dbRows: trendingRows.rows,
-        seenIds,
-        minVideos: 4,
+        minVideos: 2,
       });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
-    // Browse by Tag (older than 2 days)
+    // New Uploads - recent only
+    // -------------------------
+    {
+      const newRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+          AND v.created_at >= now() - interval '7 days'
+        ORDER BY v.created_at DESC
+        LIMIT 40
+        `
+      );
+
+      await addRow({
+        key: "new-uploads",
+        title: "New Uploads",
+        dbRows: newRows.rows,
+        minVideos: 1,
+      });
+    }
+
+    // -------------------------
+    // Browse by Tag - older than Trending window
     // -------------------------
     {
       const olderTagSource = await pool.query(
@@ -2324,76 +2419,23 @@ app.get("/api/home", async (req, res) => {
           AND v.media_type = 'video'
           AND v.created_at < now() - interval '2 days'
         ORDER BY v.views DESC NULLS LAST, v.created_at DESC
-        LIMIT 200
+        LIMIT 300
         `
       );
 
       const tagRows = buildRowsByTags(olderTagSource.rows, {
-        maxRows: 6,
+        maxRows: 8,
         minCount: 2,
       });
 
       for (const tagRow of tagRows) {
-        const built = await buildHomeRow({
-          req,
+        await addRow({
           key: tagRow.key,
           title: tagRow.title,
           dbRows: tagRow.videos,
-          seenIds,
-          minVideos: 4,
+          minVideos: 2,
         });
-
-        if (built) rows.push(built);
       }
-    }
-
-    // -------------------------
-    // New Uploads
-    // -------------------------
-    {
-      const newRows = await pool.query(
-        `
-        SELECT
-          v.id,
-          v.user_id,
-          v.title,
-          v.description,
-          v.category,
-          v.visibility,
-          v.media_type,
-          v.asset_scope,
-          v.filename,
-          v.thumb,
-          v.duration_text,
-          v.views,
-          v.tags,
-          v.created_at AS "createdAt",
-          v.updated_at AS "updatedAt",
-          u.username AS channel_username,
-          COALESCE(p.display_name, '') AS channel_display_name
-        FROM videos v
-        JOIN users u ON u.id = v.user_id
-        LEFT JOIN user_profiles p ON p.user_id = u.id
-        WHERE v.visibility = 'public'
-          AND v.asset_scope = 'public'
-          AND v.media_type = 'video'
-        ORDER BY v.created_at DESC
-        LIMIT 40
-        `
-      );
-
-      const row = await buildHomeRow({
-        req,
-        key: "new-uploads",
-        title: "New Uploads",
-        dbRows: newRows.rows,
-        seenIds,
-        minVideos: 1,
-        allowDuplicates: true,
-        limit: 12,
-      });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
@@ -2443,34 +2485,86 @@ app.get("/api/home", async (req, res) => {
           AND v.media_type = 'video'
           ${watchedClause}
         ORDER BY RANDOM()
-        LIMIT 16
+        LIMIT 24
         `,
         params
       );
 
-      const row = await buildHomeRow({
-        req,
+      await addRow({
         key: "explore",
         title: "Explore Something New",
         dbRows: exploreRows.rows,
-        seenIds,
-        minVideos: 4,
+        minVideos: 2,
       });
-
-      if (row) rows.push(row);
     }
 
     // -------------------------
-    // Final trim
+    // Procedural Fill Rows
+    // Anything not placed above gets a best-fit tag row.
     // -------------------------
-    const finalRows = rows.slice(0, 6);
+    {
+      const fillRows = await pool.query(
+        `
+        SELECT
+          v.id,
+          v.user_id,
+          v.title,
+          v.description,
+          v.category,
+          v.visibility,
+          v.media_type,
+          v.asset_scope,
+          v.filename,
+          v.thumb,
+          v.duration_text,
+          v.views,
+          v.tags,
+          v.created_at AS "createdAt",
+          v.updated_at AS "updatedAt",
+          u.username AS channel_username,
+          COALESCE(p.display_name, '') AS channel_display_name
+        FROM videos v
+        JOIN users u ON u.id = v.user_id
+        LEFT JOIN user_profiles p ON p.user_id = u.id
+        WHERE v.visibility = 'public'
+          AND v.asset_scope = 'public'
+          AND v.media_type = 'video'
+        ORDER BY v.views DESC NULLS LAST, v.created_at DESC
+        LIMIT 500
+        `
+      );
 
+      const remaining = fillRows.rows.filter(
+        (video) => !seenIds.has(String(video.id))
+      );
+
+      const proceduralTagRows = buildRowsByTags(remaining, {
+        maxRows: 12,
+        minCount: 1,
+      });
+
+      for (const tagRow of proceduralTagRows) {
+        await addRow({
+          key: `procedural:${tagRow.key}`,
+          title: tagRow.title,
+          dbRows: tagRow.videos,
+          minVideos: 1,
+        });
+      }
+    }
+
+    const finalRows = rows.slice(0, FINAL_ROW_LIMIT);
+
+    await grantFreeRowVideos(userId, finalRows);
     return res.json(finalRows);
   } catch (e) {
     console.error("GET /api/home error:", e);
-    return res.status(500).json({ error: e.message || "Failed to load home rows" });
+    return res.status(500).json({
+      error: e.message || "Failed to load home rows",
+    });
   }
 });
+
 
 app.patch("/api/videos/:id", requireAuth, async (req, res) => {
   const videoId = String(req.params.id);
@@ -3574,9 +3668,22 @@ app.get("/api/videos", async (req, res) => {
 app.get("/api/videos/:id", async (req, res) => {
   try {
     const v = await fetchVideoById(req.params.id);
+
     if (!v) return res.status(404).json({ error: "Not found" });
 
     const requesterId = req.user?.id ? Number(req.user.id) : null;
+
+    const canWatch =
+      hasPaidTier(req.user) ||
+      (await hasFreeGrant(requesterId, req.params.id));
+
+    if (!canWatch) {
+      return res.status(403).json({
+        error: "Upgrade required to watch this video.",
+        code: "PLAN_REQUIRED",
+      });
+    }
+
     const ownerId = Number(v.user_id);
 
     const isOwner = requesterId != null && requesterId === ownerId;
