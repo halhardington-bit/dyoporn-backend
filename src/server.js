@@ -1806,6 +1806,22 @@ function buildRowsByTags(videos, { maxRows = 6, minCount = 2 } = {}) {
   }));
 }
 
+async function isPublicPreviewVideo(videoId) {
+  const result = await pool.query(
+    `
+    SELECT id
+    FROM videos
+    WHERE visibility = 'public'
+      AND asset_scope = 'public'
+      AND media_type = 'video'
+    ORDER BY created_at DESC
+    LIMIT 2
+    `
+  );
+
+  return result.rows.some((row) => String(row.id) === String(videoId));
+}
+
 async function buildHomeRow({
   req,
   key,
@@ -3674,8 +3690,10 @@ app.get("/api/videos/:id", async (req, res) => {
     const requesterId = req.user?.id ? Number(req.user.id) : null;
 
     const canWatch =
-      hasPaidTier(req.user) ||
-      (await hasFreeGrant(requesterId, req.params.id));
+    hasPaidTier(req.user) ||
+    (requesterId
+      ? await hasFreeGrant(requesterId, req.params.id)
+      : await isPublicPreviewVideo(req.params.id));
 
     if (!canWatch) {
       return res.status(403).json({
