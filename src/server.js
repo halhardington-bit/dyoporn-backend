@@ -472,6 +472,7 @@ app.use(async (req, _res, next) => {
   } catch {
     req.user = null;
   }
+
   next();
 });
 
@@ -1033,6 +1034,315 @@ app.patch("/api/mod/users/:id", requireAuth, requireModerator, async (req, res) 
 });
 
 
+app.get("/api/mod/stats", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const days = Math.min(Number(req.query.days || 7), 30);
+
+    const { rows: dailyRows } = await pool.query(
+      `
+      SELECT
+        d.day::date,
+
+        COALESCE(v.site_visits, 0)::int AS site_visits,
+        COALESCE(v.unique_visitors, 0)::int AS unique_visitors,
+        COALESCE(v.logged_in_visitors, 0)::int AS logged_in_visitors,
+
+        COALESCE(w.minutes_watched, 0)::int AS minutes_watched,
+        COALESCE(w.videos_watched, 0)::int AS videos_watched,
+
+        COALESCE(s.beta_signups, 0)::int AS beta_signups,
+        COALESCE(u.uploads, 0)::int AS uploads,
+
+        COALESCE(r.reports_created, 0)::int AS reports_created,
+        COALESCE(r.reports_actioned, 0)::int AS reports_actioned
+
+      FROM generate_series(
+        CURRENT_DATE - ($1::int - 1),
+        CURRENT_DATE,
+        INTERVAL '1 day'
+      ) d(day)
+
+      LEFT JOIN (
+        SELECT
+          day,
+          site_visits,
+          unique_visitors,
+          logged_in_visitors
+        FROM daily_site_stats
+        WHERE day >= CURRENT_DATE - ($1::int - 1)
+      ) v ON v.day = d.day
+
+      LEFT JOIN (
+        SELECT
+          watched_at::date AS day,
+          ROUND(SUM(progress_seconds) / 60.0) AS minutes_watched,
+          COUNT(*) AS videos_watched
+        FROM watch_history
+        WHERE watched_at >= CURRENT_DATE - ($1::int - 1)
+        GROUP BY watched_at::date
+      ) w ON w.day = d.day
+
+      LEFT JOIN (
+        SELECT
+          created_at::date AS day,
+          COUNT(*) AS beta_signups
+        FROM beta_waitlist
+        WHERE created_at >= CURRENT_DATE - ($1::int - 1)
+        GROUP BY created_at::date
+      ) s ON s.day = d.day
+
+      LEFT JOIN (
+        SELECT
+          created_at::date AS day,
+          COUNT(*) AS uploads
+        FROM videos
+        WHERE created_at >= CURRENT_DATE - ($1::int - 1)
+        GROUP BY created_at::date
+      ) u ON u.day = d.day
+
+      LEFT JOIN (
+        SELECT
+          created_at::date AS day,
+          COUNT(*) AS reports_created,
+          COUNT(*) FILTER (
+            WHERE status = 'archived'
+              OR action_taken IS NOT NULL
+              OR addressed_at IS NOT NULL
+          ) AS reports_actioned
+        FROM video_reports
+        WHERE created_at >= CURRENT_DATE - ($1::int - 1)
+        GROUP BY created_at::date
+      ) r ON r.day = d.day
+
+      ORDER BY d.day ASC
+      `,
+      [days]
+    );
+
+    const { rows: topVideos } = await pool.query(
+      `
+      SELECT
+        v.id,
+        v.title,
+        u.username,
+        COALESCE(p.display_name, '') AS display_name,
+
+        COUNT(*)::int AS watches,
+
+        COALESCE(
+          ROUND(SUM(COALESCE(wh.progress_seconds, 0)) / 60.0),
+          0
+        )::int AS minutes_watched
+
+      FROM watch_history wh
+      JOIN videos v ON v.id::text = wh.video_id::text
+      JOIN users u ON u.id = v.user_id
+      LEFT JOIN user_profiles p ON p.user_id = u.id
+
+      WHERE wh.watched_at >= CURRENT_DATE - ($1::int - 1)
+
+      GROUP BY
+        v.id,
+        v.title,
+        u.username,
+        p.display_name
+
+      ORDER BY
+        minutes_watched DESC,
+        watches DESC
+
+      LIMIT 5
+      `,
+      [days]
+    );
+
+
+    const { rows: topReported } = await pool.query(
+      `
+      SELECT
+        COALESCE(v.id::text, r.video_id::text) AS video_id,
+        COALESCE(v.title, r.video_title_snapshot, 'Deleted video') AS title,
+        COALESCE(u.username, '') AS username,
+        COALESCE(p.display_name, '') AS display_name,
+        COUNT(r.id)::int AS reports
+      FROM video_reports r
+      LEFT JOIN videos v ON v.id::text = r.video_id::text
+      LEFT JOIN users u ON u.id = COALESCE(v.user_id, r.subject_user_id)
+      LEFT JOIN user_profiles p ON p.user_id = u.id
+      WHERE r.created_at >= CURRENT_DATE - ($1::int - 1)
+      GROUP BY
+        COALESCE(v.id::text, r.video_id::text),
+        COALESCE(v.title, r.video_title_snapshot, 'Deleted video'),
+        u.username,
+        p.display_name
+      ORDER BY reports DESC
+      LIMIT 5
+      `,
+      [days]
+    );
+
+    const totals = dailyRows.reduce(
+      (acc, row) => {
+        acc.siteVisits += Number(row.site_visits || 0);
+        acc.uniqueVisitors += Number(row.unique_visitors || 0);
+        acc.loggedInVisitors += Number(row.logged_in_visitors || 0);
+        acc.minutesWatched += Number(row.minutes_watched || 0);
+        acc.videosWatched += Number(row.videos_watched || 0);
+        acc.betaSignups += Number(row.beta_signups || 0);
+        acc.uploads += Number(row.uploads || 0);
+        acc.reportsCreated += Number(row.reports_created || 0);
+        acc.reportsActioned += Number(row.reports_actioned || 0);
+        return acc;
+      },
+      {
+        siteVisits: 0,
+        uniqueVisitors: 0,
+        loggedInVisitors: 0,
+        minutesWatched: 0,
+        videosWatched: 0,
+        betaSignups: 0,
+        uploads: 0,
+        reportsCreated: 0,
+        reportsActioned: 0,
+      }
+    );
+
+    return res.json({
+      ok: true,
+      days,
+      totals,
+      daily: dailyRows,
+      topVideos: topVideos.map((row) => ({
+        id: row.id,
+        title: row.title,
+        username: row.username,
+        displayName: row.display_name || row.username,
+        watches: Number(row.watches || 0),
+        minutesWatched: Number(row.minutes_watched || 0),
+      })),
+      topReported: topReported.map((row) => ({
+        videoId: row.video_id,
+        title: row.title,
+        username: row.username,
+        displayName: row.display_name || row.username || "Unknown creator",
+        reports: Number(row.reports || 0),
+      })),
+    });
+  } catch (e) {
+    console.error("GET /api/mod/stats error:", e);
+    return res.status(500).json({
+      error: "Failed to load moderation stats",
+    });
+  }
+});
+
+app.post("/api/analytics/pageview", async (req, res) => {
+  try {
+    const pagePath = String(req.body?.path || "").trim();
+
+    if (!pagePath || pagePath.startsWith("/moderation")) {
+      return res.json({ ok: true, skipped: true });
+    }
+
+    let visitorId = req.cookies?.visitor_id;
+
+    if (!visitorId) {
+      visitorId = crypto.randomUUID();
+
+      res.cookie("visitor_id", visitorId, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        maxAge: 1000 * 60 * 60 * 24 * 365,
+        path: "/",
+      });
+    }
+
+    const visitorKey = req.user?.id
+      ? `user:${req.user.id}`
+      : `anon:${visitorId}`;
+
+    await pool.query("BEGIN");
+
+    await pool.query(
+    `
+    INSERT INTO daily_site_stats (
+      day,
+      site_visits,
+      unique_visitors,
+      logged_in_visitors,
+      updated_at
+    )
+    VALUES (
+      CURRENT_DATE,
+      1,
+      0,
+      0,
+      NOW()
+    )
+    ON CONFLICT (day)
+    DO UPDATE SET
+      site_visits = daily_site_stats.site_visits + 1,
+      updated_at = NOW()
+    `
+  );
+
+    const uniqueInsert = await pool.query(
+      `
+      INSERT INTO daily_site_visitors (day, visitor_key)
+      VALUES (CURRENT_DATE, $1)
+      ON CONFLICT DO NOTHING
+      `,
+      [visitorKey]
+    );const { rows: topVideos } = await pool.query(
+  `
+  SELECT
+    v.id,
+    v.title,
+    u.username,
+    COALESCE(p.display_name, '') AS display_name,
+    COUNT(wh.video_id)::int AS watches,
+    ROUND(SUM(COALESCE(wh.progress_seconds, 0)) / 60.0)::int AS minutes_watched
+  FROM watch_history wh
+  JOIN videos v ON v.id::text = wh.video_id::text
+  JOIN users u ON u.id = v.user_id
+  LEFT JOIN user_profiles p ON p.user_id = u.id
+  WHERE wh.watched_at >= CURRENT_DATE - ($1::int - 1)
+  GROUP BY
+    v.id,
+    v.title,
+    u.username,
+    p.display_name
+  ORDER BY
+    minutes_watched DESC,
+    watches DESC
+  LIMIT 10
+  `,
+  [days]
+);
+
+    if (uniqueInsert.rowCount > 0) {
+      await pool.query(
+        `
+        UPDATE daily_site_stats
+        SET
+          unique_visitors = unique_visitors + 1,
+          logged_in_visitors = logged_in_visitors + $1,
+          updated_at = NOW()
+        WHERE day = CURRENT_DATE
+        `,
+        [req.user?.id ? 1 : 0]
+      );
+    }
+    await pool.query("COMMIT");
+
+    return res.json({ ok: true });
+  } catch (e) {
+    await pool.query("ROLLBACK").catch(() => {});
+    console.warn("pageview tracking failed:", e.message);
+    return res.json({ ok: false });
+  }
+});
 
 app.post("/api/me/renew-plan", requireAuth, requireNotBanned, async (req, res) => {
   const userId = Number(req.user.id);
