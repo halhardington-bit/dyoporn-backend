@@ -24,10 +24,18 @@ import { getOrCreateUserMediaKey } from "./mediaKeys.js";
 import { registerEndpointPublish } from "./EndpointPublish.js";
 import { requestDeleteEmailForUser, confirmDeleteAccount } from "./accountDelete.js";
 
+
+import {
+  REFERRAL_COOKIE_NAME,
+  normalizeReferral,
+  getReferralCookieOptions,
+  encodeReferralCookie,
+  getReferralFromRequest,
+} from "./referrals.js";
+
 import passport from "passport";
 
 import geoip from "geoip-lite";
-
 
 // ✅ S3 helpers (single import, consistent exports)
 import {
@@ -349,6 +357,93 @@ app.use(cookieParser());
 
 app.use(passport.initialize());
 
+
+app.get("/api/referral/capture", async (req, res) => {
+  try {
+    const ref = normalizeReferral(req.query.ref);
+    const landingPath = String(
+      req.query.path || req.get("referer") || "/"
+    ).slice(0, 500);
+
+    // Only record fresh referral-link visits.
+    // Do not record cookie-only visits.
+    if (!ref) {
+      return res.json({ ok: true, referral: null, skipped: true });
+    }
+
+    // Never record moderator/admin pages as marketing referrals.
+    if (landingPath.startsWith("/moderation")) {
+      return res.json({ ok: true, referral: null, skipped: true });
+    }
+
+    let visitorId = req.cookies?.visitor_id;
+
+    if (!visitorId) {
+      visitorId = crypto.randomUUID();
+
+      res.cookie("visitor_id", visitorId, {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        maxAge: 1000 * 60 * 60 * 24 * 365,
+        path: "/",
+      });
+    }
+
+    const ipRaw = getClientIp(req) || "";
+    const ipHash = ipRaw
+      ? crypto.createHash("sha256").update(ipRaw).digest("hex")
+      : null;
+
+    const userAgent = String(req.get("user-agent") || "").slice(0, 500);
+
+    await pool.query(
+      `
+      INSERT INTO referral_visits (
+        referral_source,
+        referral_code,
+        landing_path,
+        user_id,
+        visitor_id,
+        ip_hash,
+        user_agent
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `,
+      [
+        ref,
+        ref,
+        landingPath,
+        req.user?.id || null,
+        visitorId,
+        ipHash,
+        userAgent,
+      ]
+    );
+
+    const referral = {
+      code: ref,
+      source: ref,
+      landingPath,
+      createdAt: new Date().toISOString(),
+    };
+
+    res.cookie(
+      REFERRAL_COOKIE_NAME,
+      encodeReferralCookie(referral),
+      getReferralCookieOptions()
+    );
+
+    return res.json({
+      ok: true,
+      referral,
+    });
+  } catch (err) {
+    console.error("referral capture error:", err);
+    return res.status(500).json({ error: "Failed to capture referral" });
+  }
+});
+
 // -------------------------
 // Paths / storage
 // -------------------------
@@ -379,6 +474,8 @@ const LATEST_VERSION_MANIFEST = {
   release_notes:
     "Fixed FlashVSR variance explosion and improved warp blending.",
 };
+
+
 
 // -------------------------
 // Session -> req.user
@@ -426,6 +523,137 @@ async function getUserFromSession(req) {
   };
 }
 
+app.use(async (req, _res, next) => {
+  try {
+    req.user = await getUserFromSession(req);
+  } catch {
+    req.user = null;
+  }
+
+  next();
+});
+
+app.get("/api/mod/videos/:id/watch-analytics", requireModerator, async (req, res) => {
+  try {
+    const videoId = Number(req.params.id);
+    const bucketSize = Math.max(5, Math.min(60, Number(req.query.bucket || 15)));
+
+    const result = await pool.query(
+      `
+      WITH expanded AS (
+        SELECT
+          COALESCE(referral_source, 'unknown') AS referral_source,
+          generate_series(
+            floor(watched_start_sec / $2)::int * $2,
+            floor((watched_end_sec - 1) / $2)::int * $2,
+            $2
+          ) AS bucket_start
+        FROM video_watch_events
+        WHERE video_id = $1
+      )
+      SELECT
+        referral_source,
+        bucket_start,
+        bucket_start + $2 AS bucket_end,
+        COUNT(*)::int AS watches
+      FROM expanded
+      GROUP BY referral_source, bucket_start
+      ORDER BY bucket_start ASC, referral_source ASC
+      `,
+      [videoId, bucketSize]
+    );
+
+    res.json({
+      video_id: videoId,
+      bucket_size: bucketSize,
+      rows: result.rows,
+    });
+  } catch (err) {
+    console.error("watch analytics error:", err);
+    res.status(500).json({ error: "Failed to load watch analytics" });
+  }
+});
+
+app.post("/api/videos/:id/watch-event", async (req, res) => {
+  try {
+    const videoId = Number(req.params.id);
+
+    const {
+      session_id,
+      watched_start_sec,
+      watched_end_sec,
+      event_type = "watch",
+    } = req.body || {};
+
+    if (!videoId || !session_id) {
+      return res.status(400).json({ error: "Missing video/session" });
+    }
+
+    const start = Math.max(0, Math.floor(Number(watched_start_sec)));
+    const end = Math.max(0, Math.floor(Number(watched_end_sec)));
+
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      return res.status(400).json({ error: "Invalid watch range" });
+    }
+
+    // Prevent giant ranges
+    const cappedEnd = Math.min(end, start + 60);
+
+    const referralFromCookie = getReferralFromRequest(req);
+    let referralSource =
+      normalizeReferral(referralFromCookie?.source || referralFromCookie?.code) ||
+      null;
+
+    // fallback to stored user referral source
+    if (!referralSource && req.user?.id) {
+      const userReferral = await pool.query(
+        `
+        SELECT referral_source
+        FROM users
+        WHERE id = $1
+        LIMIT 1
+        `,
+        [req.user.id]
+      );
+
+      referralSource = normalizeReferral(
+        userReferral.rows[0]?.referral_source
+      );
+    }
+
+    referralSource = referralSource || "other";
+
+    await pool.query(
+      `
+      INSERT INTO video_watch_events (
+        video_id,
+        user_id,
+        session_id,
+        referral_source,
+        watched_start_sec,
+        watched_end_sec,
+        event_type
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
+      `,
+      [
+        videoId,
+        req.user?.id || null,
+        String(session_id).slice(0, 120),
+        referralSource,
+        start,
+        cappedEnd,
+        event_type,
+      ]
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("watch-event error:", err);
+    res.status(500).json({ error: "Failed to save watch event" });
+  }
+});
+
 
 app.post("/api/account/delete/request", requireAuth, async (req, res) => {
   try {
@@ -465,16 +693,7 @@ app.post("/api/account/delete/confirm", async (req, res) => {
   }
 });
 
-// attach req.user early
-app.use(async (req, _res, next) => {
-  try {
-    req.user = await getUserFromSession(req);
-  } catch {
-    req.user = null;
-  }
 
-  next();
-});
 
 async function requireAuth(req, res, next) {
   const user = req.user ?? (await getUserFromSession(req));
@@ -527,6 +746,8 @@ async function requireNotBanned(req, res, next) {
   req.user = user;
   next();
 }
+
+
 
 app.get("/api/region-check", (req, res) => {
   const enabled = process.env.ENABLE_AU_GEOFENCE === "1";
@@ -884,6 +1105,7 @@ app.get("/api/mod/users", requireAuth, requireModerator, async (req, res) => {
         u.tokens,
         u.is_moderator AS "isModerator",
         u.tier,
+        COALESCE(u.referral_source, 'Other') AS "referralSource",
         u.is_comment_shadowbanned AS "isCommentShadowbanned",
         u.is_banned AS "isBanned",
         COALESCE(rs.rating_avg, 0) AS "ratingAvg",
@@ -1181,6 +1403,24 @@ app.get("/api/mod/stats", requireAuth, requireModerator, async (req, res) => {
       [days]
     );
 
+    const { rows: referralRows } = await pool.query(
+      `
+      SELECT
+        referral_source,
+        COUNT(*)::int AS count
+      FROM referral_visits
+      WHERE created_at >= CURRENT_DATE - ($1::int - 1)
+      GROUP BY referral_source
+      ORDER BY count DESC, referral_source ASC
+      `,
+      [days]
+    );
+
+    const referralTotal = referralRows.reduce(
+      (sum, row) => sum + Number(row.count || 0),
+      0
+    );
+
     const totals = dailyRows.reduce(
       (acc, row) => {
         acc.siteVisits += Number(row.site_visits || 0);
@@ -1220,6 +1460,13 @@ app.get("/api/mod/stats", requireAuth, requireModerator, async (req, res) => {
         watches: Number(row.watches || 0),
         minutesWatched: Number(row.minutes_watched || 0),
       })),
+      referrals: {
+        total: referralTotal,
+        sources: referralRows.map((row) => ({
+          source: row.referral_source || "unknown",
+          count: Number(row.count || 0),
+        })),
+      },
       topReported: topReported.map((row) => ({
         videoId: row.video_id,
         title: row.title,
@@ -1294,32 +1541,7 @@ app.post("/api/analytics/pageview", async (req, res) => {
       ON CONFLICT DO NOTHING
       `,
       [visitorKey]
-    );const { rows: topVideos } = await pool.query(
-  `
-  SELECT
-    v.id,
-    v.title,
-    u.username,
-    COALESCE(p.display_name, '') AS display_name,
-    COUNT(wh.video_id)::int AS watches,
-    ROUND(SUM(COALESCE(wh.progress_seconds, 0)) / 60.0)::int AS minutes_watched
-  FROM watch_history wh
-  JOIN videos v ON v.id::text = wh.video_id::text
-  JOIN users u ON u.id = v.user_id
-  LEFT JOIN user_profiles p ON p.user_id = u.id
-  WHERE wh.watched_at >= CURRENT_DATE - ($1::int - 1)
-  GROUP BY
-    v.id,
-    v.title,
-    u.username,
-    p.display_name
-  ORDER BY
-    minutes_watched DESC,
-    watches DESC
-  LIMIT 10
-  `,
-  [days]
-);
+    );
 
     if (uniqueInsert.rowCount > 0) {
       await pool.query(
@@ -1630,6 +1852,251 @@ app.delete("/api/channels/:channelId/subscribe", requireAuth, async (req, res) =
   } catch (err) {
     console.error("Unsubscribe error:", err);
     return res.status(500).json({ error: "Failed to unsubscribe" });
+  }
+});
+
+app.patch("/videos/:id/visibility", requireModerator, async (req, res) => {
+  const id = Number(req.params.id);
+  const visibility = String(req.body.visibility || "").toLowerCase();
+
+  const allowed = ["public", "private", "unlisted", "shadow"];
+
+  if (!allowed.includes(visibility)) {
+    return res.status(400).json({ error: "Invalid visibility" });
+  }
+
+  const result = await pool.query(
+    `
+      UPDATE videos
+      SET visibility = $1
+      WHERE id = $2
+      RETURNING id, visibility
+    `,
+    [visibility, id]
+  );
+
+  if (!result.rowCount) {
+    return res.status(404).json({ error: "Video not found" });
+  }
+
+  res.json(result.rows[0]);
+});
+
+app.get("/api/mod/videos", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    const filterBy = String(req.query.filterBy || "all");
+    const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 50));
+    const offset = Math.max(0, Number(req.query.offset) || 0);
+
+    const values = [limit, offset];
+    let whereSql = "";
+
+    if (q) {
+      values.push(q);
+
+      if (filterBy === "id") {
+        whereSql = `WHERE CAST(v.id AS TEXT) ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "title") {
+        whereSql = `WHERE COALESCE(v.title, '') ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "username") {
+        whereSql = `WHERE COALESCE(u.username, '') ILIKE '%' || $3 || '%'`;
+      } else if (filterBy === "visibility") {
+        whereSql = `WHERE COALESCE(v.visibility, '') ILIKE '%' || $3 || '%'`;
+      } else {
+        whereSql = `
+          WHERE
+            CAST(v.id AS TEXT) ILIKE '%' || $3 || '%'
+            OR COALESCE(v.title, '') ILIKE '%' || $3 || '%'
+            OR COALESCE(u.username, '') ILIKE '%' || $3 || '%'
+            OR COALESCE(v.visibility, '') ILIKE '%' || $3 || '%'
+        `;
+      }
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        v.id,
+        v.title,
+        v.user_id AS "userId",
+        u.username,
+        COALESCE(v.views, 0) AS views,
+        COALESCE(rs.rating_avg, 0) AS "ratingAvg",
+        COALESCE(rs.rating_count, 0) AS "ratingCount",
+        COALESCE(cs.comment_count, 0) AS "commentCount",
+        v.duration,
+        v.duration_text AS "durationText",
+        COALESCE(v.visibility, 'public') AS visibility,
+        v.created_at AS "createdAt"
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.user_id
+      LEFT JOIN LATERAL (
+        SELECT
+          ROUND(AVG(vr.rating)::numeric, 2) AS rating_avg,
+          COUNT(*)::int AS rating_count
+        FROM video_ratings vr
+        WHERE vr.video_id::text = v.id::text
+      ) rs ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS comment_count
+        FROM video_comments c
+        WHERE c.video_id::text = v.id::text
+      ) cs ON TRUE
+      ${whereSql}
+      ORDER BY v.created_at DESC
+      LIMIT $1 OFFSET $2
+      `,
+      values
+    );
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error("GET /api/mod/videos failed", err);
+    res.status(500).json({ error: "Failed to load moderation videos" });
+  }
+});
+
+
+app.get("/api/mod/videos/:id", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+
+    const result = await pool.query(
+      `
+      SELECT
+        v.id,
+        v.title,
+        v.description,
+        v.category,
+        v.tags,
+        v.user_id AS "userId",
+        u.username,
+        COALESCE(p.display_name, '') AS "displayName",
+
+        COALESCE(v.views, 0) AS views,
+        COALESCE(rs.rating_avg, 0) AS "ratingAvg",
+        COALESCE(rs.rating_count, 0) AS "ratingCount",
+        COALESCE(cs.comment_count, 0) AS "commentCount",
+
+        v.duration,
+        v.duration_text AS "durationText",
+        COALESCE(v.visibility, 'public') AS visibility,
+
+        v.media_type AS "mediaType",
+        v.asset_scope AS "assetScope",
+        v.filename,
+        v.thumb,
+
+        v.created_at AS "createdAt",
+        v.updated_at AS "updatedAt"
+      FROM videos v
+      LEFT JOIN users u ON u.id = v.user_id
+      LEFT JOIN user_profiles p ON p.user_id = v.user_id
+      LEFT JOIN LATERAL (
+        SELECT
+          ROUND(AVG(vr.rating)::numeric, 2) AS rating_avg,
+          COUNT(*)::int AS rating_count
+        FROM video_ratings vr
+        WHERE vr.video_id::text = v.id::text
+      ) rs ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS comment_count
+        FROM video_comments c
+        WHERE c.video_id::text = v.id::text
+      ) cs ON TRUE
+      WHERE v.id::text = $1::text
+      LIMIT 1
+      `,
+      [videoId]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("GET /api/mod/videos/:id failed", err);
+    res.status(500).json({ error: "Failed to load moderation video" });
+  }
+});
+
+app.patch("/api/mod/videos/:id", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+
+    const title = String(req.body?.title || "").trim();
+    const visibility = String(req.body?.visibility || "").trim().toLowerCase();
+
+    const allowedVisibility = new Set(["public", "private", "unlisted", "shadow"]);
+
+    if (!title) {
+      return res.status(400).json({ error: "Title is required" });
+    }
+
+    if (!allowedVisibility.has(visibility)) {
+      return res.status(400).json({ error: "Invalid visibility" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE videos
+      SET
+        title = $2,
+        visibility = $3,
+        updated_at = NOW()
+      WHERE id::text = $1::text
+      RETURNING
+        id,
+        title,
+        visibility,
+        updated_at AS "updatedAt"
+      `,
+      [videoId, title, visibility]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /api/mod/videos/:id failed", err);
+    res.status(500).json({ error: "Failed to update moderation video" });
+  }
+});
+
+app.patch("/api/mod/videos/:id/visibility", requireAuth, requireModerator, async (req, res) => {
+  try {
+    const videoId = req.params.id;
+    const visibility = String(req.body?.visibility || "").trim().toLowerCase();
+
+    const allowed = new Set(["public", "private", "unlisted", "shadow"]);
+
+    if (!allowed.has(visibility)) {
+      return res.status(400).json({ error: "Invalid visibility" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE videos
+      SET visibility = $2,
+          updated_at = NOW()
+      WHERE id::text = $1::text
+      RETURNING id, visibility
+      `,
+      [videoId, visibility]
+    );
+
+    if (!result.rows[0]) {
+      return res.status(404).json({ error: "Video not found" });
+    }
+
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error("PATCH /api/mod/videos/:id/visibility failed", err);
+    res.status(500).json({ error: "Failed to update video visibility" });
   }
 });
 

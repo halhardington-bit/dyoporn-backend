@@ -18,6 +18,7 @@ import {
 
 import { OAuth2Client } from "google-auth-library";
 import { reconcileExpiredPlanForUser } from "./billing.js";
+import { getReferralFromRequest } from "./referrals.js";
 
 const router = express.Router();
 const googleTokenClient = new OAuth2Client();
@@ -70,7 +71,7 @@ function makeRandomPassword() {
   return crypto.randomBytes(32).toString("hex");
 }
 
-async function findOrCreateGoogleUserFromIdTokenPayload(payload) {
+async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
   const provider = "google";
   const providerUserId = String(payload.sub);
   const email = String(payload.email || "").trim().toLowerCase() || null;
@@ -119,21 +120,35 @@ async function findOrCreateGoogleUserFromIdTokenPayload(payload) {
   await pool.query("BEGIN");
 
   try {
+    const referral = getReferralFromRequest(req);
     const userInsert = await pool.query(
       `
       INSERT INTO users (
         email,
         username,
         password_hash,
-        email_verified
+        email_verified,
+        referral_source,
+        referral_code,
+        referral_landing_path,
+        referral_created_at
       )
-      VALUES ($1, $2, $3, $4)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
       RETURNING id
       `,
-      [email, username, passwordHash, emailVerified]
+      [
+        email,
+        username,
+        passwordHash,
+        emailVerified,
+        referral?.source || null,
+        referral?.code || null,
+        referral?.landingPath || null,
+        referral?.createdAt || null,
+      ]
     );
 
-    const userId = userInsert.rows[0].id;
+   const userId = userInsert.rows[0].id;
 
     await pool.query(
       `
@@ -207,8 +222,9 @@ passport.use(
         process.env.NODE_ENV === "production"
           ? "https://api.dyop.ai/auth/google/callback"
           : "http://localhost:3001/auth/google/callback",
+      passReqToCallback: true,
     },
-    async (accessToken, refreshToken, profile, done) => {
+    async (req, accessToken, refreshToken, profile, done) => {
       try {
         const provider = "google";
         const providerUserId = String(profile.id);
@@ -548,6 +564,10 @@ router.post("/register", async (req, res) => {
   const passwordHash = await bcrypt.hash(password, 12);
 
   try {
+    const referral = getReferralFromRequest(req);
+    console.log("[REGISTER] req.cookies:", req.cookies);
+    console.log("[REGISTER] referral:", referral);
+
     const result = await pool.query(
       `
       INSERT INTO users (
@@ -555,9 +575,13 @@ router.post("/register", async (req, res) => {
         username,
         password_hash,
         date_of_birth,
-        country
+        country,
+        referral_source,
+        referral_code,
+        referral_landing_path,
+        referral_created_at
       )
-      VALUES ($1, $2, $3, $4, $5)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING
         id,
         email,
@@ -571,7 +595,17 @@ router.post("/register", async (req, res) => {
         is_moderator,
         tier
       `,
-      [email, username, passwordHash, dateOfBirth, country]
+      [
+        email,
+        username,
+        passwordHash,
+        dateOfBirth,
+        country,
+        referral?.source || null,
+        referral?.code || null,
+        referral?.landingPath || null,
+        referral?.createdAt || null,
+      ]
     );
 
     const user = result.rows[0];
