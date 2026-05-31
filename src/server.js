@@ -2488,7 +2488,9 @@ async function toApiVideo(req, v) {
     description: v.description || "",
     category: v.category || "Other",
     visibility: v.visibility || "public",
-
+    
+    userId: v.user_id,
+    channelUserId: v.user_id,
     channelUsername: v.channel_username,
     channelDisplayName: v.channel_display_name || v.channel_username,
 
