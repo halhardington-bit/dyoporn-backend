@@ -1761,6 +1761,32 @@ const upload = multer({
   },
 });
 
+const AVATAR_DIR = path.join(DATA_ROOT, "avatars");
+fs.mkdirSync(AVATAR_DIR, { recursive: true });
+
+const avatarUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, AVATAR_DIR),
+    filename: (_req, file, cb) => {
+      const ext = path.extname(file.originalname || "").toLowerCase() || ".jpg";
+      const name = `${Date.now()}-${crypto.randomBytes(8).toString("hex")}${ext}`;
+      cb(null, name);
+    },
+  }),
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+  fileFilter: (_req, file, cb) => {
+    const mime = String(file.mimetype || "").toLowerCase();
+    const ext = path.extname(file.originalname || "").toLowerCase();
+
+    const ok =
+      ["image/jpeg", "image/png", "image/webp"].includes(mime) &&
+      [".jpg", ".jpeg", ".png", ".webp"].includes(ext);
+
+    cb(ok ? null : new Error("Only JPG, PNG, or WEBP images are allowed"), ok);
+  },
+});
 
 
 // -------------------------
@@ -2064,6 +2090,82 @@ app.patch("/api/mod/videos/:id", requireAuth, requireModerator, async (req, res)
   } catch (err) {
     console.error("PATCH /api/mod/videos/:id failed", err);
     res.status(500).json({ error: "Failed to update moderation video" });
+  }
+});
+
+app.post("/api/me/avatar", requireAuth, avatarUpload.single("avatar"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: "Avatar image is required" });
+    }
+
+    const userId = Number(req.user.id);
+
+    const ext = path.extname(req.file.originalname || "").toLowerCase() || ".jpg";
+    const avatarKey = `avatars/${userId}/${crypto.randomBytes(12).toString("hex")}${ext}`;
+
+    let avatarUrl;
+
+    if (VIDEO_SOURCE === "aws") {
+      const assetsBucket = process.env.S3_ASSETS_BUCKET;
+
+      if (!assetsBucket) {
+        throw new Error("Missing env S3_ASSETS_BUCKET while uploading avatar");
+      }
+
+      const assetsS3 = makeAssetsS3Client();
+
+      await retry(() =>
+        uploadFileToAssetsBucket({
+          assetsS3,
+          bucket: assetsBucket,
+          key: avatarKey,
+          filePath: req.file.path,
+          contentType: req.file.mimetype || "application/octet-stream",
+        })
+      );
+
+      avatarUrl = CDN_ASSETS_BASE_URL
+        ? `${CDN_ASSETS_BASE_URL}/${avatarKey}`
+        : `https://${assetsBucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${avatarKey}`;
+    } else {
+      avatarUrl = `${baseUrl(req)}/avatars/${req.file.filename}`;
+    }
+
+    await pool.query(
+      `
+      INSERT INTO user_profiles (user_id, avatar_url, updated_at)
+      VALUES ($1, $2, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET
+        avatar_url = EXCLUDED.avatar_url,
+        updated_at = NOW()
+      `,
+      [userId, avatarUrl]
+    );
+
+    if (VIDEO_SOURCE === "aws") {
+      try {
+        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+      } catch {}
+    }
+
+    return res.json({
+      ok: true,
+      avatarUrl,
+    });
+  } catch (e) {
+    console.error("POST /api/me/avatar error:", e);
+
+    try {
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
+      }
+    } catch {}
+
+    return res.status(500).json({
+      error: e?.message || "Failed to upload avatar",
+    });
   }
 });
 
@@ -2441,6 +2543,7 @@ async function fetchVideoById(videoId) {
       v.created_at AS "createdAt",
       v.updated_at AS "updatedAt",
       u.username AS channel_username,
+      p.avatar_url AS channel_avatar_url,
       COALESCE(p.display_name, '') AS channel_display_name
     FROM videos v
     JOIN users u ON u.id = v.user_id
@@ -2493,6 +2596,7 @@ async function toApiVideo(req, v) {
     channelUserId: v.user_id,
     channelUsername: v.channel_username,
     channelDisplayName: v.channel_display_name || v.channel_username,
+    channelAvatarUrl: v.channel_avatar_url || "",
 
     createdAt: v.createdAt,
     updatedAt: v.updatedAt,
@@ -3635,6 +3739,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
         c.is_shadow_hidden,
         u.username,
         COALESCE(p.display_name, '') AS display_name,
+        COALESCE(p.avatar_url, '') AS avatar_url,
         COALESCE(cls.like_count, 0) AS like_count,
         CASE
           WHEN $3::bigint IS NULL THEN false
@@ -3667,6 +3772,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
       userId: Number(r.user_id),
       username: r.username,
       displayName: r.display_name || r.username,
+      avatarUrl: r.avatar_url || "",
       body: r.body,
       createdAt: r.created_at,
       updatedAt: r.updated_at,
@@ -3692,6 +3798,7 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
           c.is_shadow_hidden,
           u.username,
           COALESCE(p.display_name, '') AS display_name,
+          COALESCE(p.avatar_url, '') AS avatar_url,
           COALESCE(cls.like_count, 0) AS like_count,
           CASE
             WHEN $3::bigint IS NULL THEN false
@@ -3721,13 +3828,18 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
 
       for (const r of replies.rows) {
         const pid = Number(r.parent_comment_id);
-        if (!byParent.has(pid)) byParent.set(pid, []);
+
+        if (!byParent.has(pid)) {
+          byParent.set(pid, []);
+        }
+
         byParent.get(pid).push({
           id: Number(r.id),
           videoId: r.video_id,
           userId: Number(r.user_id),
           username: r.username,
           displayName: r.display_name || r.username,
+          avatarUrl: r.avatar_url || "",
           body: r.body,
           createdAt: r.created_at,
           updatedAt: r.updated_at,
@@ -3742,7 +3854,12 @@ app.get("/api/videos/:videoId/comments", async (req, res) => {
       }
     }
 
-    res.json({ videoId, items: topItems, limit, offset });
+    res.json({
+      videoId,
+      items: topItems,
+      limit,
+      offset,
+    });
   } catch (e) {
     console.error("GET /api/videos/:videoId/comments error:", e);
     res.status(500).json({ error: "Failed to load comments" });
@@ -3825,11 +3942,18 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, requireNotBanned
     );
 
     const profile = await pool.query(
-      `SELECT COALESCE(display_name, '') AS display_name FROM user_profiles WHERE user_id = $1`,
+      `
+      SELECT
+        COALESCE(display_name, '') AS display_name,
+        COALESCE(avatar_url, '') AS avatar_url
+      FROM user_profiles
+      WHERE user_id = $1
+      `,
       [userId]
     );
 
     const displayName = profile.rows[0]?.display_name || req.user.username;
+    const avatarUrl = profile.rows[0]?.avatar_url || "";
 
     res.json({
       ok: true,
@@ -3839,6 +3963,7 @@ app.post("/api/videos/:videoId/comments", requireVerifiedEmail, requireNotBanned
         userId: Number(result.rows[0].user_id),
         username: req.user.username,
         displayName,
+        avatarUrl,
         body: result.rows[0].body,
         parentCommentId: result.rows[0].parent_comment_id
           ? Number(result.rows[0].parent_comment_id)
@@ -4826,6 +4951,7 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
 // Static thumbs (local placeholder + local mode thumbs)
 // -------------------------
 app.use("/thumbs", express.static(THUMB_DIR));
+app.use("/avatars", express.static(AVATAR_DIR));
 
 // -------------------------
 // Local streaming endpoint (only used when VIDEO_SOURCE=local)
@@ -4913,9 +5039,15 @@ app.use((err, _req, res, _next) => {
   if (err) {
     const msg = err.message || "Upload failed";
     // Treat upload validation problems as 400
-    const status = msg.toLowerCase().includes("video") || msg.toLowerCase().includes("file")
-      ? 400
-      : 500;
+    const status =
+      msg.toLowerCase().includes("video") ||
+      msg.toLowerCase().includes("file") ||
+      msg.toLowerCase().includes("jpg") ||
+      msg.toLowerCase().includes("png") ||
+      msg.toLowerCase().includes("webp") ||
+      msg.toLowerCase().includes("image")
+        ? 400
+        : 500;
     return res.status(status).json({ error: msg });
   }
   return res.status(500).json({ error: "Unknown error" });

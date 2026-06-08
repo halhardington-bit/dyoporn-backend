@@ -141,7 +141,10 @@ router.patch("/me", requireAuth, async (req, res) => {
   // profile fields (user_profiles table)
   const displayName = String(req.body?.displayName ?? "").trim().slice(0, 80);
   const bio = String(req.body?.bio ?? "").trim().slice(0, 500);
-  const avatarUrl = String(req.body?.avatarUrl ?? "").trim().slice(0, 500);
+  const avatarUrl =
+    req.body?.avatarUrl === undefined
+      ? null
+      : String(req.body?.avatarUrl ?? "").trim().slice(0, 500);
   const bannerUrl = String(req.body?.bannerUrl ?? "").trim().slice(0, 500);
   const location = String(req.body?.location ?? "").trim().slice(0, 80);
   const website = String(req.body?.website ?? "").trim().slice(0, 200);
@@ -175,7 +178,7 @@ router.patch("/me", requireAuth, async (req, res) => {
       DO UPDATE SET
         display_name = EXCLUDED.display_name,
         bio = EXCLUDED.bio,
-        avatar_url = EXCLUDED.avatar_url,
+        avatar_url = COALESCE(EXCLUDED.avatar_url, user_profiles.avatar_url),
         banner_url = EXCLUDED.banner_url,
         location = EXCLUDED.location,
         website = EXCLUDED.website,
