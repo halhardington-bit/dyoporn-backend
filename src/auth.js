@@ -71,6 +71,20 @@ function makeRandomPassword() {
   return crypto.randomBytes(32).toString("hex");
 }
 
+function makeTemporaryGoogleUsername() {
+  return `user_${crypto.randomBytes(6).toString("hex")}`.slice(0, 32);
+}
+
+function validateUsername(username) {
+  if (!username) return "Username is required";
+  if (username.length < 3) return "Username must be at least 3 characters";
+  if (username.length > 32) return "Username must be 32 characters or fewer";
+  if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+    return "Username can only contain letters, numbers, and underscores";
+  }
+  return null;
+}
+
 async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
   const provider = "google";
   const providerUserId = String(payload.sub);
@@ -93,25 +107,16 @@ async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
     return identityResult.rows[0].id;
   }
 
-  const baseUsername =
-    displayName
-      .toLowerCase()
-      .replace(/[^a-z0-9_]/g, "_")
-      .replace(/_+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 24) || "user";
-
-  let username = baseUsername;
-  let suffix = 1;
+  let username = makeTemporaryGoogleUsername();
 
   while (true) {
     const existing = await pool.query(
       `SELECT id FROM users WHERE username = $1 LIMIT 1`,
       [username]
     );
+
     if (!existing.rows[0]) break;
-    suffix += 1;
-    username = `${baseUsername}_${suffix}`.slice(0, 32);
+    username = makeTemporaryGoogleUsername();
   }
 
   const randomPassword = makeRandomPassword();
@@ -131,9 +136,10 @@ async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
         referral_source,
         referral_code,
         referral_landing_path,
-        referral_created_at
+        referral_created_at,
+        username_needs_setup
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
       RETURNING id
       `,
       [
@@ -230,14 +236,10 @@ passport.use(
         const providerUserId = String(profile.id);
         const email =
           profile.emails?.[0]?.value?.trim().toLowerCase() || null;
-        const displayName =
-          profile.displayName?.trim() ||
-          profile.name?.givenName?.trim() ||
-          "user";
 
         const identityResult = await pool.query(
           `
-          SELECT u.id, u.username
+          SELECT u.id
           FROM user_identities ui
           JOIN users u ON u.id = ui.user_id
           WHERE ui.provider = $1 AND ui.provider_user_id = $2
@@ -250,25 +252,16 @@ passport.use(
           return done(null, { id: identityResult.rows[0].id });
         }
 
-        // No auto-linking by email in this version.
-        const baseUsername = displayName
-          .toLowerCase()
-          .replace(/[^a-z0-9_]/g, "_")
-          .replace(/_+/g, "_")
-          .replace(/^_+|_+$/g, "")
-          .slice(0, 24) || "user";
-
-        let username = baseUsername;
-        let suffix = 1;
+        let username = makeTemporaryGoogleUsername();
 
         while (true) {
           const existing = await pool.query(
             `SELECT id FROM users WHERE username = $1 LIMIT 1`,
             [username]
           );
+
           if (!existing.rows[0]) break;
-          suffix += 1;
-          username = `${baseUsername}_${suffix}`.slice(0, 32);
+          username = makeTemporaryGoogleUsername();
         }
 
         const randomPassword = makeRandomPassword();
@@ -276,18 +269,33 @@ passport.use(
 
         await pool.query("BEGIN");
 
+        const referral = getReferralFromRequest(req);
+
         const userInsert = await pool.query(
           `
           INSERT INTO users (
             email,
             username,
             password_hash,
-            email_verified
+            email_verified,
+            referral_source,
+            referral_code,
+            referral_landing_path,
+            referral_created_at,
+            username_needs_setup
           )
-          VALUES ($1, $2, $3, $4)
+          VALUES ($1, $2, $3, true, $4, $5, $6, $7, true)
           RETURNING id
           `,
-          [email, username, passwordHash, true]
+          [
+            email,
+            username,
+            passwordHash,
+            referral?.source || null,
+            referral?.code || null,
+            referral?.landingPath || null,
+            referral?.createdAt || null,
+          ]
         );
 
         const userId = userInsert.rows[0].id;
@@ -345,7 +353,7 @@ router.post("/google/token", async (req, res) => {
       return res.status(400).json({ error: "Invalid Google token payload" });
     }
 
-    const userId = await findOrCreateGoogleUserFromIdTokenPayload(payload);
+    const userId = await findOrCreateGoogleUserFromIdTokenPayload(payload, req);
 
     await getOrCreateUserMediaKey(userId);
     await createSession(userId, res);
@@ -938,6 +946,70 @@ router.post("/send-change-password-email", async (req, res) => {
   }
 });
 
+router.post("/complete-google-signup", async (req, res) => {
+  const sid = req.cookies?.session_id;
+  if (!sid) return res.status(401).json({ error: "Not logged in" });
+
+  const username = String(req.body?.username || "").trim();
+  const usernameError = validateUsername(username);
+
+  if (usernameError) {
+    return res.status(400).json({ error: usernameError });
+  }
+
+  try {
+    const user = await getUserBySessionId(sid);
+    if (!user) return res.status(401).json({ error: "Not logged in" });
+
+    const result = await pool.query(
+      `
+      UPDATE users
+      SET username = $2,
+          username_needs_setup = false
+      WHERE id = $1
+      RETURNING
+        id,
+        email,
+        username,
+        tokens,
+        rating,
+        review_count,
+        email_verified,
+        is_moderator,
+        tier,
+        date_of_birth,
+        country,
+        username_needs_setup
+      `,
+      [user.id, username]
+    );
+
+    const u = result.rows[0];
+
+    return res.json({
+      id: u.id,
+      email: u.email,
+      username: u.username,
+      tokens: u.tokens,
+      rating: u.rating,
+      reviewCount: u.review_count,
+      emailVerified: !!u.email_verified,
+      isModerator: !!u.is_moderator,
+      tier: u.tier,
+      dateOfBirth: u.date_of_birth,
+      country: u.country,
+      usernameNeedsSetup: !!u.username_needs_setup,
+    });
+  } catch (err) {
+    if (err?.code === "23505") {
+      return res.status(400).json({ error: "That username is already taken" });
+    }
+
+    console.error("Complete Google signup error:", err);
+    return res.status(500).json({ error: "Failed to update username" });
+  }
+});
+
 router.post("/logout", async (req, res) => {
   const sid = req.cookies?.session_id;
 
@@ -967,6 +1039,7 @@ router.get("/me", async (req, res) => {
         u.is_moderator,
         u.tier,
         u.date_of_birth,
+        u.username_needs_setup,
         u.country
       FROM sessions s
       JOIN users u ON u.id = s.user_id
@@ -994,6 +1067,7 @@ router.get("/me", async (req, res) => {
         u.plan_active,
         u.plan_expiry,
         u.date_of_birth,
+        u.username_needs_setup,
         u.country
       FROM users u
       WHERE u.id = $1
@@ -1020,6 +1094,7 @@ router.get("/me", async (req, res) => {
       planExpiry: u.plan_expiry,
       dateOfBirth: u.date_of_birth,
       country: u.country,
+      usernameNeedsSetup: !!u.username_needs_setup,
     });
 
   } catch (err) {
