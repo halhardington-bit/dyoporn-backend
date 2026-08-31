@@ -740,6 +740,54 @@ async function requireNotBanned(req, res, next) {
   next();
 }
 
+app.get("/api/ads/vast", async (req, res) => {
+  try {
+    const zoneId = String(req.query.zoneId || "").trim();
+
+    if (!zoneId) {
+      return res.status(400).send("Missing zoneId");
+    }
+
+    const reviveUrl =
+      `https://servedby.revive-adserver.net/fc.php` +
+      `?script=apVideo:vast2` +
+      `&zoneid=${encodeURIComponent(zoneId)}` +
+      `&cb=${Date.now()}`;
+
+    const response = await fetch(reviveUrl, {
+      headers: {
+        "User-Agent": "DYOP-Ad-Proxy/1.0",
+      },
+    });
+
+    if (!response.ok) {
+      return res
+        .status(response.status)
+        .send("Revive request failed");
+    }
+
+    const xml = await response.text();
+
+    res.setHeader(
+      "Content-Type",
+      response.headers.get("content-type") ||
+        "application/xml"
+    );
+
+    res.setHeader(
+      "Cache-Control",
+      "no-store, no-cache, must-revalidate"
+    );
+
+    return res.status(200).send(xml);
+  } catch (err) {
+    console.error("VAST proxy failed:", err);
+
+    return res
+      .status(502)
+      .send("Advertisement unavailable");
+  }
+});
 
 
 app.get("/api/region-check", (req, res) => {
