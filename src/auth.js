@@ -17,7 +17,6 @@ import {
 } from "./mailer.js";
 
 import { OAuth2Client } from "google-auth-library";
-import { reconcileExpiredPlanForUser } from "./billing.js";
 import { getReferralFromRequest } from "./referrals.js";
 
 const router = express.Router();
@@ -128,7 +127,7 @@ async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
     const referral = getReferralFromRequest(req);
     const userInsert = await pool.query(
       `
-      INSERT INTO users (
+     INSERT INTO users (
         email,
         username,
         password_hash,
@@ -137,9 +136,18 @@ async function findOrCreateGoogleUserFromIdTokenPayload(payload, req) {
         referral_code,
         referral_landing_path,
         referral_created_at,
-        username_needs_setup
+        username_needs_setup,
+        tier,
+        plan_active,
+        plan_expiry
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8,
+        true,
+        'Premium',
+        TRUE,
+        NULL
+      )
       RETURNING id
       `,
       [
@@ -282,9 +290,18 @@ passport.use(
             referral_code,
             referral_landing_path,
             referral_created_at,
-            username_needs_setup
+            username_needs_setup,
+            tier,
+            plan_active,
+            plan_expiry
           )
-          VALUES ($1, $2, $3, true, $4, $5, $6, $7, true)
+          VALUES (
+            $1, $2, $3, true, $4, $5, $6, $7,
+            true,
+            'Premium',
+            TRUE,
+            NULL
+          )
           RETURNING id
           `,
           [
@@ -587,9 +604,17 @@ router.post("/register", async (req, res) => {
         referral_source,
         referral_code,
         referral_landing_path,
-        referral_created_at
+        referral_created_at,
+        tier,
+        plan_active,
+        plan_expiry
       )
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9,
+        'Premium',
+        TRUE,
+        NULL
+      )
       RETURNING
         id,
         email,
@@ -1049,8 +1074,23 @@ router.get("/me", async (req, res) => {
     );
 
     if (!result.rows[0]) return res.status(401).json(null);
-
-    await reconcileExpiredPlanForUser(result.rows[0].id);
+    
+    await pool.query(
+      `
+      UPDATE users
+      SET
+        tier = 'Premium',
+        plan_active = TRUE,
+        plan_expiry = NULL
+      WHERE id = $1
+        AND (
+          tier IS DISTINCT FROM 'Premium'
+          OR plan_active IS DISTINCT FROM TRUE
+          OR plan_expiry IS NOT NULL
+        )
+      `,
+      [result.rows[0].id]
+    );
 
     const refreshed = await pool.query(
       `

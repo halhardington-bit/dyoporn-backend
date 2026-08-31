@@ -704,36 +704,29 @@ async function requireAuth(req, res, next) {
 
 app.patch("/api/me/tier", requireAuth, requireNotBanned, async (req, res) => {
   const userId = Number(req.user.id);
-  const tier = String(req.body?.tier || "").trim();
-
-  const allowedTiers = new Set(["Free", "Watcher", "Basic", "Premium"]);
-
-  if (!allowedTiers.has(tier)) {
-    return res.status(400).json({ error: "Invalid tier" });
-  }
 
   try {
     await pool.query(
       `
       UPDATE users
       SET
-        tier = $2,
+        tier = 'Premium',
         plan_active = TRUE,
-        plan_expiry =
-          CASE
-            WHEN plan_expiry IS NOT NULL AND plan_expiry > now()
-              THEN date_trunc('hour', plan_expiry) + interval '1 month'
-            ELSE date_trunc('hour', now()) + interval '1 month'
-          END
+        plan_expiry = NULL
       WHERE id = $1
       `,
-      [userId, tier]
+      [userId]
     );
 
-    return res.json({ ok: true, tier });
+    return res.json({
+      ok: true,
+      tier: "Premium",
+      planActive: true,
+      planExpiry: null,
+    });
   } catch (e) {
     console.error("PATCH /api/me/tier error:", e);
-    return res.status(500).json({ error: "Failed to update tier" });
+    return res.status(500).json({ error: "Failed to update account" });
   }
 });
 
