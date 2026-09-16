@@ -790,6 +790,8 @@ app.get("/api/ads/vast", async (req, res) => {
 });
 
 
+
+
 app.get("/api/region-check", (req, res) => {
   const enabled = process.env.ENABLE_AU_GEOFENCE === "1";
 
@@ -4622,6 +4624,67 @@ app.get("/api/videos", async (req, res) => {
   } catch (e) {
     console.error("GET /api/videos search error:", e);
     res.status(500).json({ error: "Failed to load videos" });
+  }
+});
+
+// PUBLIC VIDEO METADATA
+// Used by social previews, SEO crawlers, Discord, etc.
+// This does NOT grant permission to actually watch the video.
+app.get("/api/videos/:id/metadata", async (req, res) => {
+  try {
+    const v = await fetchVideoById(req.params.id);
+
+    if (!v) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    // Only expose normal public videos.
+    // Never expose library/private/unlisted assets through this endpoint.
+    if (v.asset_scope !== "public") {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    if (v.visibility !== "public") {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    // Reuse your existing API transformation so thumbnail URLs,
+    // channel information, dates, etc. stay consistent.
+    const apiVideo = await toApiVideo(req, v);
+
+    // Return ONLY metadata useful for previews / SEO.
+    // Deliberately omit playbackUrl and user-specific information.
+    return res.json({
+      id: apiVideo.id,
+      title: apiVideo.title,
+      description: apiVideo.description,
+      category: apiVideo.category,
+      visibility: apiVideo.visibility,
+
+      channelUserId: apiVideo.channelUserId,
+      channelUsername: apiVideo.channelUsername,
+      channelDisplayName: apiVideo.channelDisplayName,
+      channelAvatarUrl: apiVideo.channelAvatarUrl,
+
+      createdAt: apiVideo.createdAt,
+      updatedAt: apiVideo.updatedAt,
+
+      durationText: apiVideo.durationText,
+      durationSeconds: apiVideo.durationSeconds,
+
+      tags: apiVideo.tags,
+
+      mediaType: apiVideo.mediaType,
+      assetScope: apiVideo.assetScope,
+
+      thumbUrl: apiVideo.thumbUrl
+    });
+  } catch (e) {
+    console.error("GET /api/videos/:id/metadata error:", e);
+
+    return res.status(500).json({
+      error: "Failed to load video metadata"
+    });
   }
 });
 
