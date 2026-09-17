@@ -4688,6 +4688,47 @@ app.get("/api/videos/:id/metadata", async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------
+// PUBLIC SEO SITEMAP DATA
+// Used by DYOP's sitemap.xml generator.
+//
+// Returns ONLY the information required to build public URLs.
+// No playback URLs, private videos, library assets, etc.
+// ---------------------------------------------------------
+
+app.get("/api/seo/sitemap", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        v.id,
+        v.updated_at,
+        v.created_at,
+        u.username
+      FROM videos v
+      LEFT JOIN users u
+        ON u.id = v.user_id
+      WHERE v.visibility = 'public'
+        AND v.asset_scope = 'public'
+      ORDER BY v.created_at DESC
+    `);
+
+    const videos = result.rows.map((row) => ({
+      id: String(row.id),
+      updatedAt: row.updated_at || row.created_at,
+      username: row.username || null,
+    }));
+
+    return res.json({
+      videos,
+    });
+  } catch (error) {
+    console.error("GET /api/seo/sitemap error:", error);
+
+    return res.status(500).json({
+      error: "Failed to generate sitemap data",
+    });
+  }
+});
 
 app.get("/api/videos/:id", async (req, res) => {
   try {
@@ -4916,13 +4957,13 @@ app.post("/api/videos/upload", requireAuth, upload.single("video"), async (req, 
 
     const tS3 = Date.now();
     await retry(() =>
-      uploadDirToS3({
-        uploadFileToS3,
-        bucket: uploadsBucket,
-        localDir: hlsDir,
-        keyPrefix: hlsKeyPrefix,
-      })
-    );
+    uploadDirToS3({
+      uploadFileToS3,
+      bucket,
+      localDir: hlsOutDir,
+      keyPrefix: hlsKeyPrefix,
+    })
+  );
     log("S3 HLS upload ok", { ms: Date.now() - tS3 });
 
     storedFilename = `${hlsKeyPrefix}/master.m3u8`;
