@@ -4767,7 +4767,7 @@ app.get("/api/videos/:id/metadata", async (req, res) => {
 // PUBLIC SEO SITEMAP DATA
 // Used by DYOP's sitemap.xml generator.
 //
-// Returns ONLY the information required to build public URLs.
+// Returns ONLY information required to build public URLs.
 // No playback URLs, private videos, library assets, etc.
 // ---------------------------------------------------------
 
@@ -4778,12 +4778,14 @@ app.get("/api/seo/sitemap", async (req, res) => {
         v.id,
         v.updated_at,
         v.created_at,
+        v.tags,
         u.username
       FROM videos v
       LEFT JOIN users u
         ON u.id = v.user_id
       WHERE v.visibility = 'public'
         AND v.asset_scope = 'public'
+        AND v.media_type = 'video'
       ORDER BY v.created_at DESC
     `);
 
@@ -4791,13 +4793,21 @@ app.get("/api/seo/sitemap", async (req, res) => {
       id: String(row.id),
       updatedAt: row.updated_at || row.created_at,
       username: row.username || null,
+      tags: Array.isArray(row.tags)
+        ? row.tags
+            .map((tag) => String(tag).trim())
+            .filter(Boolean)
+        : [],
     }));
 
     return res.json({
       videos,
     });
   } catch (error) {
-    console.error("GET /api/seo/sitemap error:", error);
+    console.error(
+      "GET /api/seo/sitemap error:",
+      error
+    );
 
     return res.status(500).json({
       error: "Failed to generate sitemap data",
