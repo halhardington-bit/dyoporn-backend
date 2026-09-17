@@ -4355,6 +4355,67 @@ app.post("/api/videos/:id/report", requireAuth, async (req, res) => {
 });
 
 
+// ---------------------------------------------------------
+// PUBLIC TAG METADATA
+// Used by DYOP tag pages, social previews and SEO crawlers.
+// ---------------------------------------------------------
+
+app.get("/api/seo/tags/:tag", async (req, res) => {
+  try {
+    const tag = String(req.params.tag || "").trim();
+
+    if (!tag) {
+      return res.status(400).json({
+        error: "Missing tag",
+      });
+    }
+
+    const result = await pool.query(
+      `
+      SELECT
+        COUNT(*)::int AS video_count,
+        MAX(v.updated_at) AS updated_at
+      FROM videos v
+      WHERE v.visibility = 'public'
+        AND v.asset_scope = 'public'
+        AND v.media_type = 'video'
+        AND EXISTS (
+          SELECT 1
+          FROM unnest(
+            COALESCE(v.tags, ARRAY[]::text[])
+          ) AS video_tag
+          WHERE LOWER(TRIM(video_tag)) = LOWER($1)
+        )
+      `,
+      [tag]
+    );
+
+    const row = result.rows[0];
+
+    if (!row || Number(row.video_count) === 0) {
+      return res.status(404).json({
+        error: "Tag not found",
+      });
+    }
+
+    return res.json({
+      tag,
+      videoCount: Number(row.video_count),
+      updatedAt: row.updated_at || null,
+    });
+  } catch (error) {
+    console.error(
+      "GET /api/seo/tags/:tag error:",
+      error
+    );
+
+    return res.status(500).json({
+      error: "Failed to load tag metadata",
+    });
+  }
+});
+
+
 // -------------------------
 // Videos API
 // -------------------------
