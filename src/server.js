@@ -4362,6 +4362,7 @@ app.get("/api/videos", async (req, res) => {
   try {
     const q = String(req.query.q || "").trim();
     const category = String(req.query.category || "").trim();
+    const tag = String(req.query.tag || "").trim();
     const sort = String(req.query.sort || "newest").toLowerCase().trim();
     const filter = String(req.query.filter || "").toLowerCase().trim();
 
@@ -4564,6 +4565,19 @@ app.get("/api/videos", async (req, res) => {
     if (category) {
       where.push(`v.category = $${i++}`);
       params.push(category);
+    }
+
+    if (tag) {
+      where.push(`
+        EXISTS (
+          SELECT 1
+          FROM unnest(COALESCE(v.tags, ARRAY[]::text[])) AS video_tag
+          WHERE LOWER(TRIM(video_tag)) = LOWER($${i})
+        )
+      `);
+
+      params.push(tag);
+      i++;
     }
 
     if (q) {
